@@ -55,7 +55,7 @@ public class GetData {
         .auth().oauth2(restProperty.getProperty(TOKEN))
         .baseUri(restProperty.getProperty(BASE_URI))
         .basePath(restProperty.getProperty(PROJECT_BASE_PATH))
-        .pathParam("projectId",39).queryParam("roleId", "REVIEWER")
+        .pathParam("projectId",43).queryParam("roleId", "REVIEWER")
         .when().get("/{projectId}/users")
         .then().assertThat().statusCode(200).and().body("size()", is(1));
         
@@ -71,7 +71,7 @@ public class GetData {
         .auth().oauth2(restProperty.getProperty(TOKEN))
         .baseUri(restProperty.getProperty(BASE_URI))
         .basePath(restProperty.getProperty(PROJECT_BASE_PATH))
-        .pathParam("projectId",39).queryParam("roleId", "REVIEWER")
+        .pathParam("projectId",43).queryParam("roleId", "REVIEWER")
         .when().get("/{projectId}/users")
         .then().assertThat().statusCode(200);
         

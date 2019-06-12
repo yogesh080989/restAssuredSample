@@ -19,10 +19,10 @@ public class PostData {
         /* Response response =  RestAssured.given().auth().oauth2(token).param("securityContactId", "bumrah")
         .param("legalContactId", "virat").contentType("application/json").post("http://10.80.40.104:8888/codeinsight/api/projects/39/users");*/
         JSONObject jsonObject=new JSONObject();
-        jsonObject.put("securityContactId", "yogesh");
-        jsonObject.put("legalContactId", "yogesh");
+        jsonObject.put("securityContactId", "admin");
+        jsonObject.put("legalContactId", "admin");
 
-        Response response =  RestAssured.given().auth().oauth2(token).accept(ContentType.JSON).contentType(ContentType.JSON).body(jsonObject, ObjectMapperType.JACKSON_2).post("http://10.80.40.104:8888/codeinsight/api/projects/39/users");
+        Response response =  RestAssured.given().auth().oauth2(token).accept(ContentType.JSON).contentType(ContentType.JSON).body(jsonObject, ObjectMapperType.JACKSON_2).post("http://10.80.40.104:8888/codeinsight/api/projects/43/users");
 
         int code = response.getStatusCode(); 
         System.out.println("Status code is "+code);
