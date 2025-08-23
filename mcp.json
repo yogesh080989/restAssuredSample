@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "github-md": {
+      "command": "python",
+      "args": [
+        "./mcp-servers/github-mcp-server.py"
+      ]
+    }
+  }
+}
