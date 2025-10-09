@@ -1,0 +1,32 @@
+# .github/copilot.yaml
+
+# General Project Context
+projectInfo:
+  description: "This is a Spring Boot and React-based application for managing customer accounts and processing transactions."
+
+# Preferred Libraries and Tools
+libraries:
+  - name: Spring Boot
+    reason: "We use Spring Boot for backend services."
+  - name: React
+    reason: "We use React for the frontend."
+
+# Code Style Preferences
+style:
+  namingConvention: "Use camelCase for variables, PascalCase for classes."
+  indentation: "2 spaces"
+  patterns:
+    - description: "Use constructor injection for all services in Spring."
+    - description: "For frontend components, use functional components whenever possible."
+
+# Onboarding Guidance
+onboarding:
+  - "Welcome! Start by reading our architecture overview here: [Architecture Guide](https://internal.example.com/architecture)."
+  - "Check out the 'Getting Started' section in our README.md for a quick setup guide."
+
+# Business Feature Implementation Guide
+businessFeatureGuidelines:
+  - "When implementing a new business feature, follow our standard feature request template in the docs folder."
+  - "Ensure all new business logic is covered by unit tests using JUnit."
+  - "Refer to the 'Feature Implementation Checklist' in the `.github/FEATURE_GUIDELINES.md` file for consistency."
+
