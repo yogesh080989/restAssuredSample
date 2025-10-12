@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-check_artifact.py
+check_artifact.py - Enhanced debug logging version
 
 Usage examples:
-  python check_artifact.py --gradle-file build.gradle \
-    --coords org.apache.httpcomponents:httpcore:4.4.12
+  python check_artifact.py -g build.gradle -c org.apache.httpcomponents:httpcore:4.4.12
+  python check_artifact.py -g build.gradle -c org.apache.httpcomponents:httpcore:4.4.12 --debug
+  python check_artifact.py -g build.gradle -c org.apache.httpcomponents:httpcore:4.4.12 -u myuser -p mypass --debug
 
-  python check_artifact.py --gradle-file build.gradle \
-    --coords org.apache.httpcomponents:httpcore:4.4.12 \
-    --user myuser --pass mypass
+Notes:
+ - Credentials may be provided via CLI flags or environment variables:
+     ARTIFACTORY_USER, ARTIFACTORY_PASS
+ - The script will never log the raw password. It only indicates whether a password was supplied (masked).
+ - Exit codes: 0 = found, 1 = not found, 2 = error (file read or other fatal).
 """
 
 import re
@@ -16,7 +19,20 @@ import argparse
 import os
 import requests
 from requests.auth import HTTPBasicAuth
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
+import logging
+import time
+
+# -----------------------
+# Logging setup helper
+# -----------------------
+def setup_logging(debug: bool):
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-5s %(message)s",
+        datefmt="%H:%M:%S"
+    )
 
 # -----------------------
 # Utilities
@@ -25,11 +41,15 @@ from urllib.parse import urljoin, urlparse
 def parse_maven_repo_urls_from_gradle(gradle_path):
     """
     Extracts maven repository URLs from a Gradle file.
-    Looks for patterns like: maven { url 'https://artifactory.../artifactory/repo-name' }
-    or maven { url "..." }
-    Returns list of URLs (strings).
+    Looks for patterns like:
+      maven { url 'https://.../artifactory/repo' }
+      maven { url "..." }
+    Returns list of URLs (strings) in found order.
     """
-    url_pattern = re.compile(r'maven\s*\{[^}]*url\s*\(?["\'](?P<url>https?://[^"\'\)\s]+)["\']', re.IGNORECASE | re.DOTALL)
+    url_pattern = re.compile(
+        r'maven\s*\{[^}]*?url\s*\(?["\'](?P<url>https?://[^"\'\)\s]+)["\']',
+        re.IGNORECASE | re.DOTALL
+    )
     urls = []
     try:
         text = open(gradle_path, 'r', encoding='utf-8').read()
@@ -39,7 +59,8 @@ def parse_maven_repo_urls_from_gradle(gradle_path):
     for m in url_pattern.finditer(text):
         u = m.group("url").rstrip('/')
         urls.append(u)
-    # Deduplicate preserve order
+
+    # Deduplicate while preserving order
     seen = set()
     out = []
     for u in urls:
@@ -51,24 +72,27 @@ def parse_maven_repo_urls_from_gradle(gradle_path):
 def derive_artifactory_base_and_repo(url):
     """
     Given a repo URL, attempt to split into base Artifactory URL and repo key.
-    Examples:
-      https://artifactory.company.com/artifactory/maven-external-virtual
-        -> base: https://artifactory.company.com/artifactory, repo: maven-external-virtual
-
-      https://artifactory.company.com/artifactory/  -> repo may be missing (returns None for repo)
+    Returns (base_url, repo_key) where repo_key may be None if not derivable.
     """
     parsed = urlparse(url)
     path = parsed.path.rstrip('/')
-    parts = path.split('/')
+    parts = [p for p in path.split('/') if p]
     # find 'artifactory' segment if present
     if 'artifactory' in parts:
         idx = parts.index('artifactory')
-        base_path = '/'.join(parts[: idx + 1])  # includes 'artifactory'
+        base_path = '/' + '/'.join(parts[: idx + 1])  # includes 'artifactory'
         repo_part = '/'.join(parts[idx + 1:]) if len(parts) > idx + 1 else ''
     else:
-        # no explicit '/artifactory' in path: assume last element is repo
-        base_path = '/'.join(parts[:-1]) if len(parts) > 1 else ''
-        repo_part = parts[-1] if len(parts) >= 1 else ''
+        # assume last path segment is repo key
+        if len(parts) >= 2:
+            base_path = '/' + '/'.join(parts[:-1])
+            repo_part = parts[-1]
+        elif len(parts) == 1:
+            base_path = ''
+            repo_part = parts[0]
+        else:
+            base_path = ''
+            repo_part = ''
 
     base = f"{parsed.scheme}://{parsed.netloc}{base_path}" if base_path else f"{parsed.scheme}://{parsed.netloc}"
     repo = repo_part if repo_part else None
@@ -79,127 +103,186 @@ def maven_coordinate_to_path(group_id, artifact_id, version, file_ext):
     filename = f"{artifact_id}-{version}.{file_ext}"
     return f"{group_path}/{artifact_id}/{version}/{filename}"
 
+def safe_mask_password(pw):
+    if not pw:
+        return False, None
+    # mask everything but length info
+    return True, "*****"  # keep mask static to avoid revealing length
+
+def try_head(url, auth, timeout=10):
+    """
+    Try HEAD, if it fails due to method not allowed or an exception,
+    optionally try GET (streamed) as fallback.
+    Returns (response or None, exception_or_None)
+    """
+    try:
+        r = requests.head(url, auth=auth, timeout=timeout, allow_redirects=True)
+        return r, None
+    except requests.exceptions.RequestException as e_head:
+        # fallback to GET if HEAD fails (some servers disable HEAD)
+        try:
+            r = requests.get(url, auth=auth, timeout=timeout, stream=True, allow_redirects=True)
+            return r, None
+        except requests.exceptions.RequestException as e_get:
+            return None, e_get
+
+# -----------------------
+# Core check function
+# -----------------------
+
 def check_artifact_in_repo(base_url, repo_key, group_id, artifact_id, version, auth=None, timeout=10):
     """
-    Try to HEAD artifact jar and pom in the given Artifactory repo.
-    Returns True if found, False otherwise.
+    Try to locate artifact in the provided repo. Returns (found_bool, matched_url, details_list)
+    details_list contains tuples: (candidate_url, status_or_None, error_or_None, elapsed_secs)
     """
-    # If repo_key is None, the repo might be part of the path already (base_url includes repo)
-    possible_urls = []
+    details = []
     for ext in ('jar', 'pom'):
         rel_path = maven_coordinate_to_path(group_id, artifact_id, version, ext)
         if repo_key:
-            # base_url + /{repo_key}/ + rel_path
             candidate = f"{base_url}/{repo_key}/{rel_path}"
         else:
             candidate = f"{base_url}/{rel_path}"
-        possible_urls.append(candidate)
 
-    headers = {"User-Agent": "artifact-checker/1.0"}
-    for url in possible_urls:
-        try:
-            resp = requests.head(url, auth=auth, timeout=timeout, allow_redirects=True)
-        except requests.RequestException as e:
-            # If HEAD fails due to method not allowed, try GET but only for the particular URL
-            try:
-                resp = requests.get(url, auth=auth, timeout=timeout, stream=True)
-            except Exception:
-                continue
-        # 200 OK means artifact exists. 401/403 means credentials issue (treat as not found but warn)
-        if resp.status_code == 200:
-            return True, url, resp.status_code
-    return False, None, None
+        start = time.perf_counter()
+        resp, exc = try_head(candidate, auth=auth, timeout=timeout)
+        elapsed = time.perf_counter() - start
+
+        status = resp.status_code if resp is not None else None
+        details.append((candidate, status, repr(exc) if exc else None, elapsed))
+
+        logging.debug("Tried %s (elapsed %.3fs) -> status=%s, exc=%s", candidate, elapsed, status, repr(exc) if exc else None)
+
+        if resp is not None and resp.status_code == 200:
+            return True, candidate, details
+
+        # If we got 401/403, still note and continue searching other repos but log a warning
+        if resp is not None and resp.status_code in (401, 403):
+            logging.warning("Received %s for %s (possible auth issue).", resp.status_code, candidate)
+
+    return False, None, details
 
 # -----------------------
 # Main
 # -----------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Check if a Maven artifact exists in any Artifactory repo listed in a Gradle file.")
+    parser = argparse.ArgumentParser(description="Check if a Maven artifact exists in any Artifactory repo listed in a Gradle file. (Debug-capable)")
     parser.add_argument("--gradle-file", "-g", required=True, help="Path to build.gradle (or file containing repositories)")
     parser.add_argument("--coords", "-c", required=True, help="Maven coords in form group:artifact:version (eg org.apache.httpcomponents:httpcore:4.4.12)")
     parser.add_argument("--user", "-u", help="Artifactory username (or set ARTIFACTORY_USER env var)")
     parser.add_argument("--pass", "-p", dest="password", help="Artifactory password (or set ARTIFACTORY_PASS env var)")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging with detailed attempted URLs and statuses")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose summary output")
     args = parser.parse_args()
+
+    setup_logging(args.debug)
 
     # parse coords
     try:
         group_id, artifact_id, version = args.coords.strip().split(':')
     except Exception:
-        parser.error("coords must be in group:artifact:version format")
+        logging.error("coords must be in group:artifact:version format")
+        raise SystemExit(2)
 
     # credentials
     username = args.user or os.getenv("ARTIFACTORY_USER")
     password = args.password or os.getenv("ARTIFACTORY_PASS")
     auth = HTTPBasicAuth(username, password) if username and password else None
-    if not auth:
-        if args.verbose:
-            print("No credentials provided — will attempt anonymous access.")
+
+    pw_present, pw_masked = safe_mask_password(password)
+
+    logging.info("Starting artifact check for: %s:%s:%s", group_id, artifact_id, version)
+    if username:
+        logging.info("Using username: %s", username)
+    else:
+        logging.info("No username provided (anonymous access will be attempted)")
+
+    if pw_present:
+        logging.info("Password provided: %s", pw_masked)
+    else:
+        logging.info("No password provided")
 
     # parse gradle repos
     try:
         repo_urls = parse_maven_repo_urls_from_gradle(args.gradle_file)
     except Exception as e:
-        print(f"Error reading gradle file: {e}")
-        return_code = 2
+        logging.error("Error reading gradle file: %s", e)
         print(False)
-        raise SystemExit(return_code)
+        raise SystemExit(2)
 
-    if args.verbose:
-        print("Detected repository URLs from gradle file:")
-        for u in repo_urls:
-            print("  -", u)
+    if not repo_urls:
+        logging.warning("No repository URLs found in %s", args.gradle_file)
+    else:
+        logging.info("Found %d repository URL(s) in %s", len(repo_urls), args.gradle_file)
+        if args.debug:
+            for i, u in enumerate(repo_urls, 1):
+                logging.debug("Repo %d: %s", i, u)
 
     found = False
     found_url = None
-    found_status = None
+    matched_details = None
 
+    # first pass: derive base/repo and check
     for repo_url in repo_urls:
         base, repo_key = derive_artifactory_base_and_repo(repo_url)
-        if args.verbose:
-            print(f"Checking repo_url={repo_url}\n -> base={base}, repo_key={repo_key}")
-        ok, match_url, status = check_artifact_in_repo(base, repo_key, group_id, artifact_id, version, auth=auth)
+        logging.info("Checking repository URL: %s", repo_url)
+        logging.debug("Derived base: %s | repo_key: %s", base, repo_key)
+        try:
+            ok, match_url, details = check_artifact_in_repo(base, repo_key, group_id, artifact_id, version, auth=auth)
+        except Exception as ex:
+            logging.exception("Error while checking repo %s: %s", repo_url, ex)
+            continue
+
+        if args.debug:
+            for candidate, status, err, elapsed in details:
+                logging.debug("Candidate: %s -> status=%s, error=%s, time=%.3fs", candidate, status, err, elapsed)
+
         if ok:
             found = True
             found_url = match_url
-            found_status = status
+            matched_details = details
+            logging.info("Artifact FOUND at: %s", found_url)
             break
+        else:
+            logging.info("Not found in derived repo for: %s", repo_url)
 
-    # If not found yet, also try raw repository URLs (in case base/repo derivation failed)
+    # second pass: raw path checks if not found yet
     if not found:
+        logging.info("Attempting raw path checks on repository URLs (fallback).")
         for repo_url in repo_urls:
-            if args.verbose:
-                print(f"Trying raw path checks on {repo_url}")
-            # try as if repo_url already points to base + repo level
+            logging.debug("Raw-checking repo_url: %s", repo_url)
             for ext in ('jar', 'pom'):
-                rel = maven_coordinate_to_path(group_id, artifact_id, version, ext)
-                candidate = f"{repo_url.rstrip('/')}/{rel}"
+                candidate = f"{repo_url.rstrip('/')}/{maven_coordinate_to_path(group_id, artifact_id, version, ext)}"
+                start = time.perf_counter()
                 try:
-                    resp = requests.head(candidate, auth=auth, timeout=8, allow_redirects=True)
-                except requests.RequestException:
-                    try:
-                        resp = requests.get(candidate, auth=auth, timeout=8, stream=True)
-                    except Exception:
-                        resp = None
+                    resp, exc = try_head(candidate, auth=auth, timeout=10)
+                except Exception as e:
+                    resp, exc = None, e
+                elapsed = time.perf_counter() - start
+                status = resp.status_code if resp else None
+                logging.debug("Tried raw candidate: %s -> status=%s, exc=%s (%.3fs)", candidate, status, repr(exc) if exc else None, elapsed)
                 if resp is not None and resp.status_code == 200:
                     found = True
                     found_url = candidate
-                    found_status = resp.status_code
+                    logging.info("Artifact FOUND at (raw): %s", found_url)
                     break
             if found:
                 break
 
-    # Final result
+    # result output
     if found:
-        if args.verbose:
-            print(f"\nArtifact FOUND at: {found_url} (status {found_status})")
-        print(True)
+        if args.verbose or args.debug:
+            print("True")
+            logging.info("Exiting with success (artifact found).")
+        else:
+            print(True)
         raise SystemExit(0)
     else:
-        if args.verbose:
-            print("\nArtifact NOT FOUND in any repository listed.")
-        print(False)
+        logging.info("Artifact NOT FOUND in any repository listed.")
+        if args.verbose or args.debug:
+            print("False")
+        else:
+            print(False)
         raise SystemExit(1)
 
 if __name__ == "__main__":
