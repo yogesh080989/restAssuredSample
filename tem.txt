@@ -1,32 +1,206 @@
-# .github/copilot.yaml
+#!/usr/bin/env python3
+"""
+check_artifact.py
 
-# General Project Context
-projectInfo:
-  description: "This is a Spring Boot and React-based application for managing customer accounts and processing transactions."
+Usage examples:
+  python check_artifact.py --gradle-file build.gradle \
+    --coords org.apache.httpcomponents:httpcore:4.4.12
 
-# Preferred Libraries and Tools
-libraries:
-  - name: Spring Boot
-    reason: "We use Spring Boot for backend services."
-  - name: React
-    reason: "We use React for the frontend."
+  python check_artifact.py --gradle-file build.gradle \
+    --coords org.apache.httpcomponents:httpcore:4.4.12 \
+    --user myuser --pass mypass
+"""
 
-# Code Style Preferences
-style:
-  namingConvention: "Use camelCase for variables, PascalCase for classes."
-  indentation: "2 spaces"
-  patterns:
-    - description: "Use constructor injection for all services in Spring."
-    - description: "For frontend components, use functional components whenever possible."
+import re
+import argparse
+import os
+import requests
+from requests.auth import HTTPBasicAuth
+from urllib.parse import urljoin, urlparse
 
-# Onboarding Guidance
-onboarding:
-  - "Welcome! Start by reading our architecture overview here: [Architecture Guide](https://internal.example.com/architecture)."
-  - "Check out the 'Getting Started' section in our README.md for a quick setup guide."
+# -----------------------
+# Utilities
+# -----------------------
 
-# Business Feature Implementation Guide
-businessFeatureGuidelines:
-  - "When implementing a new business feature, follow our standard feature request template in the docs folder."
-  - "Ensure all new business logic is covered by unit tests using JUnit."
-  - "Refer to the 'Feature Implementation Checklist' in the `.github/FEATURE_GUIDELINES.md` file for consistency."
+def parse_maven_repo_urls_from_gradle(gradle_path):
+    """
+    Extracts maven repository URLs from a Gradle file.
+    Looks for patterns like: maven { url 'https://artifactory.../artifactory/repo-name' }
+    or maven { url "..." }
+    Returns list of URLs (strings).
+    """
+    url_pattern = re.compile(r'maven\s*\{[^}]*url\s*\(?["\'](?P<url>https?://[^"\'\)\s]+)["\']', re.IGNORECASE | re.DOTALL)
+    urls = []
+    try:
+        text = open(gradle_path, 'r', encoding='utf-8').read()
+    except Exception as e:
+        raise RuntimeError(f"Unable to open gradle file '{gradle_path}': {e}")
 
+    for m in url_pattern.finditer(text):
+        u = m.group("url").rstrip('/')
+        urls.append(u)
+    # Deduplicate preserve order
+    seen = set()
+    out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+def derive_artifactory_base_and_repo(url):
+    """
+    Given a repo URL, attempt to split into base Artifactory URL and repo key.
+    Examples:
+      https://artifactory.company.com/artifactory/maven-external-virtual
+        -> base: https://artifactory.company.com/artifactory, repo: maven-external-virtual
+
+      https://artifactory.company.com/artifactory/  -> repo may be missing (returns None for repo)
+    """
+    parsed = urlparse(url)
+    path = parsed.path.rstrip('/')
+    parts = path.split('/')
+    # find 'artifactory' segment if present
+    if 'artifactory' in parts:
+        idx = parts.index('artifactory')
+        base_path = '/'.join(parts[: idx + 1])  # includes 'artifactory'
+        repo_part = '/'.join(parts[idx + 1:]) if len(parts) > idx + 1 else ''
+    else:
+        # no explicit '/artifactory' in path: assume last element is repo
+        base_path = '/'.join(parts[:-1]) if len(parts) > 1 else ''
+        repo_part = parts[-1] if len(parts) >= 1 else ''
+
+    base = f"{parsed.scheme}://{parsed.netloc}{base_path}" if base_path else f"{parsed.scheme}://{parsed.netloc}"
+    repo = repo_part if repo_part else None
+    return base.rstrip('/'), repo
+
+def maven_coordinate_to_path(group_id, artifact_id, version, file_ext):
+    group_path = group_id.replace('.', '/')
+    filename = f"{artifact_id}-{version}.{file_ext}"
+    return f"{group_path}/{artifact_id}/{version}/{filename}"
+
+def check_artifact_in_repo(base_url, repo_key, group_id, artifact_id, version, auth=None, timeout=10):
+    """
+    Try to HEAD artifact jar and pom in the given Artifactory repo.
+    Returns True if found, False otherwise.
+    """
+    # If repo_key is None, the repo might be part of the path already (base_url includes repo)
+    possible_urls = []
+    for ext in ('jar', 'pom'):
+        rel_path = maven_coordinate_to_path(group_id, artifact_id, version, ext)
+        if repo_key:
+            # base_url + /{repo_key}/ + rel_path
+            candidate = f"{base_url}/{repo_key}/{rel_path}"
+        else:
+            candidate = f"{base_url}/{rel_path}"
+        possible_urls.append(candidate)
+
+    headers = {"User-Agent": "artifact-checker/1.0"}
+    for url in possible_urls:
+        try:
+            resp = requests.head(url, auth=auth, timeout=timeout, allow_redirects=True)
+        except requests.RequestException as e:
+            # If HEAD fails due to method not allowed, try GET but only for the particular URL
+            try:
+                resp = requests.get(url, auth=auth, timeout=timeout, stream=True)
+            except Exception:
+                continue
+        # 200 OK means artifact exists. 401/403 means credentials issue (treat as not found but warn)
+        if resp.status_code == 200:
+            return True, url, resp.status_code
+    return False, None, None
+
+# -----------------------
+# Main
+# -----------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Check if a Maven artifact exists in any Artifactory repo listed in a Gradle file.")
+    parser.add_argument("--gradle-file", "-g", required=True, help="Path to build.gradle (or file containing repositories)")
+    parser.add_argument("--coords", "-c", required=True, help="Maven coords in form group:artifact:version (eg org.apache.httpcomponents:httpcore:4.4.12)")
+    parser.add_argument("--user", "-u", help="Artifactory username (or set ARTIFACTORY_USER env var)")
+    parser.add_argument("--pass", "-p", dest="password", help="Artifactory password (or set ARTIFACTORY_PASS env var)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    args = parser.parse_args()
+
+    # parse coords
+    try:
+        group_id, artifact_id, version = args.coords.strip().split(':')
+    except Exception:
+        parser.error("coords must be in group:artifact:version format")
+
+    # credentials
+    username = args.user or os.getenv("ARTIFACTORY_USER")
+    password = args.password or os.getenv("ARTIFACTORY_PASS")
+    auth = HTTPBasicAuth(username, password) if username and password else None
+    if not auth:
+        if args.verbose:
+            print("No credentials provided — will attempt anonymous access.")
+
+    # parse gradle repos
+    try:
+        repo_urls = parse_maven_repo_urls_from_gradle(args.gradle_file)
+    except Exception as e:
+        print(f"Error reading gradle file: {e}")
+        return_code = 2
+        print(False)
+        raise SystemExit(return_code)
+
+    if args.verbose:
+        print("Detected repository URLs from gradle file:")
+        for u in repo_urls:
+            print("  -", u)
+
+    found = False
+    found_url = None
+    found_status = None
+
+    for repo_url in repo_urls:
+        base, repo_key = derive_artifactory_base_and_repo(repo_url)
+        if args.verbose:
+            print(f"Checking repo_url={repo_url}\n -> base={base}, repo_key={repo_key}")
+        ok, match_url, status = check_artifact_in_repo(base, repo_key, group_id, artifact_id, version, auth=auth)
+        if ok:
+            found = True
+            found_url = match_url
+            found_status = status
+            break
+
+    # If not found yet, also try raw repository URLs (in case base/repo derivation failed)
+    if not found:
+        for repo_url in repo_urls:
+            if args.verbose:
+                print(f"Trying raw path checks on {repo_url}")
+            # try as if repo_url already points to base + repo level
+            for ext in ('jar', 'pom'):
+                rel = maven_coordinate_to_path(group_id, artifact_id, version, ext)
+                candidate = f"{repo_url.rstrip('/')}/{rel}"
+                try:
+                    resp = requests.head(candidate, auth=auth, timeout=8, allow_redirects=True)
+                except requests.RequestException:
+                    try:
+                        resp = requests.get(candidate, auth=auth, timeout=8, stream=True)
+                    except Exception:
+                        resp = None
+                if resp is not None and resp.status_code == 200:
+                    found = True
+                    found_url = candidate
+                    found_status = resp.status_code
+                    break
+            if found:
+                break
+
+    # Final result
+    if found:
+        if args.verbose:
+            print(f"\nArtifact FOUND at: {found_url} (status {found_status})")
+        print(True)
+        raise SystemExit(0)
+    else:
+        if args.verbose:
+            print("\nArtifact NOT FOUND in any repository listed.")
+        print(False)
+        raise SystemExit(1)
+
+if __name__ == "__main__":
+    main()
