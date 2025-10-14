@@ -1,289 +1,407 @@
 #!/usr/bin/env python3
 """
-check_artifact.py - Enhanced debug logging version
+bd_text_recommend_remediate.py
 
-Usage examples:
-  python check_artifact.py -g build.gradle -c org.apache.httpcomponents:httpcore:4.4.12
-  python check_artifact.py -g build.gradle -c org.apache.httpcomponents:httpcore:4.4.12 --debug
-  python check_artifact.py -g build.gradle -c org.apache.httpcomponents:httpcore:4.4.12 -u myuser -p mypass --debug
+Purpose:
+  - Read a text recommendation/report (file or inline text)
+  - Extract package names and recommended versions (if present)
+  - Collect Gradle dependencies (including transitive) for a module
+  - Match report items to Gradle coordinates (heuristics)
+  - Suggest remediation: direct update (if direct dep + version) or force override (transitive)
+  - Optionally apply direct edits and/or append force snippet (backups created)
+
+Usage (dry-run):
+  python bd_text_recommend_remediate.py \
+    --project-dir /path/to/module \
+    --gradle-exec ./gradlew \
+    --configs runtimeClasspath,compileClasspath \
+    --recommendation-file /path/to/report.txt \
+    --build-file build.gradle \
+    --debug
+
+Provide recommendation as a string:
+  python bd_text_recommend_remediate.py \
+    --project-dir . --recommendation-text "Focus on upgrading the Spring Framework and Netty Project components to versions with the fewest known vulnerabilities." \
+    --debug
+
+Apply edits:
+  python bd_text_recommend_remediate.py ... --apply --force-apply
 
 Notes:
- - Credentials may be provided via CLI flags or environment variables:
-     ARTIFACTORY_USER, ARTIFACTORY_PASS
- - The script will never log the raw password. It only indicates whether a password was supplied (masked).
- - Exit codes: 0 = found, 1 = not found, 2 = error (file read or other fatal).
+ - This is a best-effort parser and uses heuristics. Always review changes before committing.
+ - If recommendations do not include concrete versions, the script will mark them as review-required
+   (you can optionally integrate with BlackDuck/Maven Central to pick target versions).
 """
 
-import re
 import argparse
-import os
-import requests
-from requests.auth import HTTPBasicAuth
-from urllib.parse import urlparse
 import logging
-import time
+import re
+import subprocess
+import json
+import os
+from pathlib import Path
+from shutil import copy2
+from typing import List, Tuple, Set, Dict
 
-# -----------------------
-# Logging setup helper
-# -----------------------
+# -------------------------
+# Logging
+# -------------------------
 def setup_logging(debug: bool):
     level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)-5s %(message)s",
-        datefmt="%H:%M:%S"
-    )
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S")
 
-# -----------------------
-# Utilities
-# -----------------------
+# -------------------------
+# Gradle helpers
+# -------------------------
+COORD_REGEX = re.compile(r'([A-Za-z0-9_\-\.]+(?:\.[A-Za-z0-9_\-\.]+)*):([A-Za-z0-9_\-\.]+):([A-Za-z0-9_\-\.]+(?:[-A-Za-z0-9_\._]*))')
+VERSION_TOKEN = re.compile(r'(\d+(?:\.\d+)+(?:[A-Za-z0-9\.\-_]*))')  # e.g. 6.2.6 or 4.2.3.Final
 
-def parse_maven_repo_urls_from_gradle(gradle_path):
-    """
-    Extracts maven repository URLs from a Gradle file.
-    Looks for patterns like:
-      maven { url 'https://.../artifactory/repo' }
-      maven { url "..." }
-    Returns list of URLs (strings) in found order.
-    """
-    url_pattern = re.compile(
-        r'maven\s*\{[^}]*?url\s*\(?["\'](?P<url>https?://[^"\'\)\s]+)["\']',
-        re.IGNORECASE | re.DOTALL
-    )
-    urls = []
-    try:
-        text = open(gradle_path, 'r', encoding='utf-8').read()
-    except Exception as e:
-        raise RuntimeError(f"Unable to open gradle file '{gradle_path}': {e}")
-
-    for m in url_pattern.finditer(text):
-        u = m.group("url").rstrip('/')
-        urls.append(u)
-
-    # Deduplicate while preserving order
-    seen = set()
-    out = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
-
-def derive_artifactory_base_and_repo(url):
-    """
-    Given a repo URL, attempt to split into base Artifactory URL and repo key.
-    Returns (base_url, repo_key) where repo_key may be None if not derivable.
-    """
-    parsed = urlparse(url)
-    path = parsed.path.rstrip('/')
-    parts = [p for p in path.split('/') if p]
-    # find 'artifactory' segment if present
-    if 'artifactory' in parts:
-        idx = parts.index('artifactory')
-        base_path = '/' + '/'.join(parts[: idx + 1])  # includes 'artifactory'
-        repo_part = '/'.join(parts[idx + 1:]) if len(parts) > idx + 1 else ''
-    else:
-        # assume last path segment is repo key
-        if len(parts) >= 2:
-            base_path = '/' + '/'.join(parts[:-1])
-            repo_part = parts[-1]
-        elif len(parts) == 1:
-            base_path = ''
-            repo_part = parts[0]
-        else:
-            base_path = ''
-            repo_part = ''
-
-    base = f"{parsed.scheme}://{parsed.netloc}{base_path}" if base_path else f"{parsed.scheme}://{parsed.netloc}"
-    repo = repo_part if repo_part else None
-    return base.rstrip('/'), repo
-
-def maven_coordinate_to_path(group_id, artifact_id, version, file_ext):
-    group_path = group_id.replace('.', '/')
-    filename = f"{artifact_id}-{version}.{file_ext}"
-    return f"{group_path}/{artifact_id}/{version}/{filename}"
-
-def safe_mask_password(pw):
-    if not pw:
-        return False, None
-    # mask everything but length info
-    return True, "*****"  # keep mask static to avoid revealing length
-
-def try_head(url, auth, timeout=10):
-    """
-    Try HEAD, if it fails due to method not allowed or an exception,
-    optionally try GET (streamed) as fallback.
-    Returns (response or None, exception_or_None)
-    """
-    try:
-        r = requests.head(url, auth=auth, timeout=timeout, allow_redirects=True)
-        return r, None
-    except requests.exceptions.RequestException as e_head:
-        # fallback to GET if HEAD fails (some servers disable HEAD)
+def run_gradle_dependencies(project_dir: str, gradle_exec: str, configurations: List[str], timeout: int = 120) -> str:
+    outputs = []
+    for cfg in configurations:
+        cmd = [gradle_exec, "dependencies", "--configuration", cfg]
+        logging.info("Running: %s (cwd=%s)", " ".join(cmd), project_dir)
         try:
-            r = requests.get(url, auth=auth, timeout=timeout, stream=True, allow_redirects=True)
-            return r, None
-        except requests.exceptions.RequestException as e_get:
-            return None, e_get
+            r = subprocess.run(cmd, cwd=project_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+            outputs.append(r.stdout)
+            logging.debug("Gradle [%s] returncode=%s", cfg, r.returncode)
+        except Exception as e:
+            logging.exception("Gradle dependencies failed for %s: %s", cfg, e)
+    return "\n".join(outputs)
 
-# -----------------------
-# Core check function
-# -----------------------
+def parse_coords_from_gradle_output(text: str) -> Set[Tuple[str,str,str]]:
+    coords = set()
+    for m in COORD_REGEX.finditer(text):
+        coords.add((m.group(1), m.group(2), m.group(3)))
+    logging.info("Parsed %d unique coordinates from Gradle output", len(coords))
+    return coords
 
-def check_artifact_in_repo(base_url, repo_key, group_id, artifact_id, version, auth=None, timeout=10):
+# -------------------------
+# Recommendation text parsing
+# -------------------------
+# Recognize lines like: "Spring Framework    6.2.6    SEV-5" or sentences "Upgrade Spring Framework to 6.2.9"
+TABLE_ROW_SPLIT = re.compile(r'\s{2,}|\t|\|')  # split columns with multiple spaces, tabs, pipes
+CAP_NAME_RE = re.compile(r'([A-Z][A-Za-z0-9\-\._]+(?:\s+[A-Z][A-Za-z0-9\-\._]+)*)')  # sequences of Capitalized words
+
+def parse_recommendation_text(text: str):
     """
-    Try to locate artifact in the provided repo. Returns (found_bool, matched_url, details_list)
-    details_list contains tuples: (candidate_url, status_or_None, error_or_None, elapsed_secs)
+    Returns:
+      - rows: list of {'name': <str>, 'version': <str or None>, 'line': <original>}
+      - sentences: list of recommendation sentences (strings)
     """
-    details = []
-    for ext in ('jar', 'pom'):
-        rel_path = maven_coordinate_to_path(group_id, artifact_id, version, ext)
-        if repo_key:
-            candidate = f"{base_url}/{repo_key}/{rel_path}"
+    # Normalize
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    rows = []
+    sentences = []
+    # detect table-like rows with explicit version token
+    for ln in lines:
+        # if contains a version token somewhere, treat as table row
+        v = VERSION_TOKEN.search(ln)
+        if v:
+            ver = v.group(1)
+            parts = TABLE_ROW_SPLIT.split(ln)
+            # heuristic: left-most non-empty part is package name
+            name = None
+            for p in parts:
+                p = p.strip()
+                if not p:
+                    continue
+                # skip if p looks just like version
+                if VERSION_TOKEN.search(p) and p == ver:
+                    continue
+                name = p
+                break
+            if not name:
+                # fallback: text before version occurrence
+                idx = ln.find(ver)
+                name = ln[:idx].strip()
+            rows.append({'name': name, 'version': ver, 'line': ln})
         else:
-            candidate = f"{base_url}/{rel_path}"
+            # check if sentence contains recommendation keywords
+            low = ln.lower()
+            if any(k in low for k in ('upgrade', 'recommended', 'recommend', 'remediation', 'priority', 'focus on upgrading', 'suggest')):
+                # possibly multiple sentences - split by .!? and keep relevant ones
+                for s in re.split(r'(?<=[\.\?\!])\s+', ln):
+                    if s.strip():
+                        sentences.append(s.strip())
+    # also split long paragraphs into sentences for recommendation detection
+    # (if no explicit lines found)
+    if not rows and not sentences:
+        for s in re.split(r'(?<=[\.\?\!])\s+', text):
+            if s.strip() and any(k in s.lower() for k in ('upgrade', 'recommend', 'remediation', 'priority', 'focus on')):
+                sentences.append(s.strip())
+    # additionally, from sentences try to extract package names and explicit version tokens
+    # e.g. "Focus on upgrading the Spring Framework and Netty Project components to versions with the fewest known vulnerabilities."
+    sent_extracted = []
+    for s in sentences:
+        # find version tokens in sentence
+        v = VERSION_TOKEN.search(s)
+        rec_ver = v.group(1) if v else None
+        # attempt to extract package names: sequences of Capitalized words
+        names = CAP_NAME_RE.findall(s)
+        # filter out generic words and short words
+        filtered = []
+        for nm in names:
+            nm = nm.strip()
+            if len(nm) < 3:
+                continue
+            # skip if appears to be start of sentence 'Focus' etc
+            if nm.lower() in ('focus', 'priority', 'recommendation', 'recommendations', 'regular', 'scanning'):
+                continue
+            filtered.append(nm)
+        if filtered:
+            for nm in filtered:
+                sent_extracted.append({'name': nm, 'recommended_version': rec_ver, 'sentence': s})
+        else:
+            # no capitalized names; maybe package names are lowercase words like 'logback' — try token matching by common package tokens
+            tokens = re.findall(r'\b[a-zA-Z0-9\-\._]{3,}\b', s)
+            # heuristic: pick tokens that are not stopwords and longer than 3
+            stop = {'the','and','to','with','for','of','in','on','be','is','are'}
+            tokens = [t for t in tokens if t.lower() not in stop and not t.isdigit()]
+            if tokens:
+                sent_extracted.append({'name': tokens[0], 'recommended_version': rec_ver, 'sentence': s})
+    # Merge table rows + sentence-extracted items (avoid duplicates)
+    items = rows[:]
+    for se in sent_extracted:
+        # avoid duplicates by name+version
+        duplicate = False
+        for r in items:
+            if r['name'] and se['name'] and r['name'].lower() == se['name'].lower():
+                duplicate = True
+                # if r lacks version but se has recommended version, attach it as 'recommended_version'
+                if 'recommended_version' not in r and se.get('recommended_version'):
+                    r['recommended_version'] = se['recommended_version']
+                break
+        if not duplicate:
+            items.append({'name': se['name'], 'version': None, 'recommended_version': se.get('recommended_version'), 'line': se.get('sentence')})
+    # normalize keys: ensure each dict has 'name', maybe 'version' and 'recommended_version'
+    normalized = []
+    for it in items:
+        normalized.append({
+            'name': it.get('name'),
+            'package_version': it.get('version') or None,
+            'recommended_version': it.get('recommended_version') or None,
+            'line': it.get('line')
+        })
+    return normalized, sentences
 
-        start = time.perf_counter()
-        resp, exc = try_head(candidate, auth=auth, timeout=timeout)
-        elapsed = time.perf_counter() - start
+# -------------------------
+# Matching heuristics
+# -------------------------
+def match_report_items_to_coords(report_items: List[Dict], coords: Set[Tuple[str,str,str]]):
+    """
+    For each report item (package_name, package_version, recommended_version) attempt to match to coords.
+    Returns mapping idx -> list of coords matched.
+    """
+    mapping = {}
+    coord_list = list(coords)
+    for idx, item in enumerate(report_items):
+        pkg = (item.get('name') or item.get('package_name') or "").lower()
+        pkg_ver = (item.get('package_version') or "").lower() if item.get('package_version') else None
+        rec_ver = (item.get('recommended_version') or "").lower() if item.get('recommended_version') else None
+        matches = []
+        for g,a,v in coord_list:
+            # exact artifact match
+            if pkg_ver and v.lower() == pkg_ver and (a.lower() in pkg or pkg in a.lower() or g.split('.')[-1].lower() in pkg):
+                matches.append((g,a,v))
+                continue
+            # artifact substring match
+            if a.lower() in pkg or pkg in a.lower():
+                matches.append((g,a,v))
+                continue
+            # group fragment match
+            if g.split('.')[-1].lower() in pkg:
+                matches.append((g,a,v))
+                continue
+        mapping[idx] = matches
+    return mapping
 
-        status = resp.status_code if resp is not None else None
-        details.append((candidate, status, repr(exc) if exc else None, elapsed))
+# -------------------------
+# build.gradle edit helpers
+# -------------------------
+DEPENDENCY_LINE_REGEX = re.compile(r"(?P<prefix>^\s*(implementation|api|compile|compileOnly|runtimeOnly|testImplementation|testCompile|testRuntime)\s+['\"])(?P<coord>[^'\"]+)['\"]", re.MULTILINE)
 
-        logging.debug("Tried %s (elapsed %.3fs) -> status=%s, exc=%s", candidate, elapsed, status, repr(exc) if exc else None)
+def find_direct_dependency_lines(build_gradle_path: Path, target_ga: str):
+    """
+    Returns True if build.gradle contains explicit dependency that starts with target group:artifact:
+    """
+    if not build_gradle_path.exists():
+        return False
+    text = build_gradle_path.read_text(encoding='utf-8')
+    return bool(re.search(re.escape(target_ga) + r":[^'\"]+", text))
 
-        if resp is not None and resp.status_code == 200:
-            return True, candidate, details
+def apply_direct_updates_to_build_gradle(build_gradle_path: Path, replacements: Dict[str,str], backup: bool = True) -> int:
+    """
+    replacements: mapping old_full_coord (g:a:oldver) -> new_full_coord (g:a:newver)
+    """
+    if not build_gradle_path.exists():
+        logging.error("build.gradle not found: %s", build_gradle_path)
+        return 0
+    text = build_gradle_path.read_text(encoding='utf-8')
+    if backup:
+        bkp = build_gradle_path.with_suffix(build_gradle_path.suffix + f".bak")
+        copy2(build_gradle_path, bkp)
+        logging.info("Backup created: %s", bkp)
+    applied = 0
+    def repl(m):
+        nonlocal applied
+        prefix = m.group('prefix')
+        coord = m.group('coord').strip()
+        for old, new in replacements.items():
+            # if exact match
+            if coord == old:
+                applied += 1
+                logging.debug("Replacing exact %s -> %s", old, new)
+                return f"{prefix}{new}'"
+            # if group:artifact matches and we want to change version
+            old_ga = ':'.join(old.split(':')[:2])
+            if coord.startswith(old_ga + ":"):
+                applied += 1
+                logging.debug("Replacing %s -> %s", coord, new)
+                return f"{prefix}{new}'"
+        return m.group(0)
+    new_text = DEPENDENCY_LINE_REGEX.sub(repl, text)
+    if applied > 0:
+        build_gradle_path.write_text(new_text, encoding='utf-8')
+        logging.info("Applied %d replacements to %s", applied, build_gradle_path)
+    else:
+        logging.info("No replacements applied to %s", build_gradle_path)
+    return applied
 
-        # If we got 401/403, still note and continue searching other repos but log a warning
-        if resp is not None and resp.status_code in (401, 403):
-            logging.warning("Received %s for %s (possible auth issue).", resp.status_code, candidate)
+def generate_force_snippet(forces: Dict[str,str]) -> str:
+    lines = [
+        "// BEGIN bd_text_recommend_remediate generated force snippet",
+        "configurations.all {",
+        "    resolutionStrategy {",
+        "        force("]
+    for i,(ga,full) in enumerate(forces.items()):
+        lines.append(f'            "{full}"{"," if i < len(forces)-1 else ""}')
+    lines.append("        )")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("// END bd_text_recommend_remediate generated force snippet")
+    return "\n".join(lines)
 
-    return False, None, details
-
-# -----------------------
-# Main
-# -----------------------
-
+# -------------------------
+# Main workflow
+# -------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Check if a Maven artifact exists in any Artifactory repo listed in a Gradle file. (Debug-capable)")
-    parser.add_argument("--gradle-file", "-g", required=True, help="Path to build.gradle (or file containing repositories)")
-    parser.add_argument("--coords", "-c", required=True, help="Maven coords in form group:artifact:version (eg org.apache.httpcomponents:httpcore:4.4.12)")
-    parser.add_argument("--user", "-u", help="Artifactory username (or set ARTIFACTORY_USER env var)")
-    parser.add_argument("--pass", "-p", dest="password", help="Artifactory password (or set ARTIFACTORY_PASS env var)")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging with detailed attempted URLs and statuses")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose summary output")
+    parser = argparse.ArgumentParser(description="Apply remediation based on textual recommendation/report")
+    parser.add_argument("--project-dir", "-d", required=True, help="Path to module (working dir for gradle).")
+    parser.add_argument("--gradle-exec", default="./gradlew", help="./gradlew or gradle")
+    parser.add_argument("--configs", default="runtimeClasspath", help="Comma-separated gradle configurations")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--recommendation-file", help="Path to a text report file containing recommendations")
+    group.add_argument("--recommendation-text", help="Inline recommendation text (quoted)")
+    parser.add_argument("--build-file", default="build.gradle", help="build.gradle relative to project-dir")
+    parser.add_argument("--apply", action="store_true", help="Apply direct dependency updates to build.gradle (backup created)")
+    parser.add_argument("--force-apply", action="store_true", help="Append resolutionStrategy.force snippet if transitive remediations exist")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     setup_logging(args.debug)
 
-    # parse coords
-    try:
-        group_id, artifact_id, version = args.coords.strip().split(':')
-    except Exception:
-        logging.error("coords must be in group:artifact:version format")
+    # 1. collect gradle coordinates
+    project_dir = args.project_dir
+    gradle_exec = args.gradle_exec
+    configs = [c.strip() for c in args.configs.split(',') if c.strip()]
+    gradle_output = run_gradle_dependencies(project_dir, gradle_exec, configs)
+    coords = parse_coords_from_gradle_output(gradle_output)
+    if not coords:
+        logging.error("No Gradle dependencies parsed; aborting.")
         raise SystemExit(2)
 
-    # credentials
-    username = args.user or os.getenv("ARTIFACTORY_USER")
-    password = args.password or os.getenv("ARTIFACTORY_PASS")
-    auth = HTTPBasicAuth(username, password) if username and password else None
-
-    pw_present, pw_masked = safe_mask_password(password)
-
-    logging.info("Starting artifact check for: %s:%s:%s", group_id, artifact_id, version)
-    if username:
-        logging.info("Using username: %s", username)
+    # 2. read recommendation text
+    if args.recommendation_file:
+        rec_text = Path(args.recommendation_file).read_text(encoding='utf-8', errors='ignore')
     else:
-        logging.info("No username provided (anonymous access will be attempted)")
+        rec_text = args.recommendation_text
 
-    if pw_present:
-        logging.info("Password provided: %s", pw_masked)
-    else:
-        logging.info("No password provided")
+    report_items, sentences = parse_recommendation_text(rec_text)
+    logging.info("Parsed %d report items and %d recommendation sentences", len(report_items), len(sentences))
+    if args.debug:
+        logging.debug("Report items sample: %s", report_items[:40])
+        logging.debug("Sentences: %s", sentences[:40])
 
-    # parse gradle repos
-    try:
-        repo_urls = parse_maven_repo_urls_from_gradle(args.gradle_file)
-    except Exception as e:
-        logging.error("Error reading gradle file: %s", e)
-        print(False)
-        raise SystemExit(2)
+    # 3. match to coords
+    mapping = match_report_items_to_coords(report_items, coords)
 
-    if not repo_urls:
-        logging.warning("No repository URLs found in %s", args.gradle_file)
-    else:
-        logging.info("Found %d repository URL(s) in %s", len(repo_urls), args.gradle_file)
-        if args.debug:
-            for i, u in enumerate(repo_urls, 1):
-                logging.debug("Repo %d: %s", i, u)
+    # 4. plan remediations
+    direct_replacements = {}  # old coord -> new coord
+    forces = {}  # group:artifact -> full coord
+    details = []
+    build_gradle_path = Path(project_dir) / args.build_file
 
-    found = False
-    found_url = None
-    matched_details = None
-
-    # first pass: derive base/repo and check
-    for repo_url in repo_urls:
-        base, repo_key = derive_artifactory_base_and_repo(repo_url)
-        logging.info("Checking repository URL: %s", repo_url)
-        logging.debug("Derived base: %s | repo_key: %s", base, repo_key)
-        try:
-            ok, match_url, details = check_artifact_in_repo(base, repo_key, group_id, artifact_id, version, auth=auth)
-        except Exception as ex:
-            logging.exception("Error while checking repo %s: %s", repo_url, ex)
+    for idx, item in enumerate(report_items):
+        pkg_name = item.get('name') or item.get('package_name') or ""
+        pkg_ver = item.get('package_version') or None
+        rec_ver = item.get('recommended_version') or None
+        matches = mapping.get(idx, [])
+        if not matches:
+            details.append({'item': item, 'matches': [], 'action': 'no-match', 'note': 'manual review required'})
             continue
+        for (g,a,v) in matches:
+            current_full = f"{g}:{a}:{v}"
+            # decide recommended target
+            recommended_full = None
+            recommended_version_extracted = None
+            if rec_ver:
+                # rec_ver might be full like '6.2.9' or have 'Final' suffix - keep as-is
+                recommended_version_extracted = rec_ver
+            else:
+                # if item itself had package_version but not recommended, we treat as current only
+                recommended_version_extracted = None
+            # If recommended_version_extracted exists and differs, decide direct vs force
+            if recommended_version_extracted and recommended_version_extracted != v:
+                recommended_full = f"{g}:{a}:{recommended_version_extracted}"
+                is_direct = find_direct_dependency_lines(build_gradle_path, f"{g}:{a}") if build_gradle_path.exists() else False
+                if is_direct:
+                    direct_replacements[current_full] = recommended_full
+                    action = f"direct-update -> {recommended_full}"
+                else:
+                    forces[f"{g}:{a}"] = recommended_full
+                    action = f"force-override -> {recommended_full}"
+            else:
+                # no recommended version present -> review required
+                action = "review-required (no explicit recommended version found)"
+            details.append({'item': item, 'matched_coord': current_full, 'action': action, 'recommended_full': recommended_full})
 
-        if args.debug:
-            for candidate, status, err, elapsed in details:
-                logging.debug("Candidate: %s -> status=%s, error=%s, time=%.3fs", candidate, status, err, elapsed)
+    # 5. output summary
+    summary = {
+        'scanned_coords': len(coords),
+        'report_items': len(report_items),
+        'direct_replacements_count': len(direct_replacements),
+        'force_overrides_count': len(forces),
+        'details_sample': details[:200]
+    }
+    print(json.dumps(summary, indent=2))
 
-        if ok:
-            found = True
-            found_url = match_url
-            matched_details = details
-            logging.info("Artifact FOUND at: %s", found_url)
-            break
+    # 6. apply changes if requested
+    if args.apply and direct_replacements:
+        applied = apply_direct_updates_to_build_gradle(build_gradle_path, direct_replacements, backup=True)
+        logging.info("Applied %d direct replacements", applied)
+    elif direct_replacements:
+        logging.info("Direct replacements prepared but not applied (use --apply)")
+
+    if forces:
+        snippet = generate_force_snippet(forces)
+        if args.force_apply:
+            if build_gradle_path.exists():
+                bkp = build_gradle_path.with_suffix(build_gradle_path.suffix + ".forcebak")
+                copy2(build_gradle_path, bkp)
+                with open(build_gradle_path, 'a', encoding='utf-8') as f:
+                    f.write("\n\n" + snippet + "\n")
+                logging.info("Appended force snippet to %s", build_gradle_path)
+            else:
+                logging.error("Cannot append force snippet; build.gradle not found at %s", build_gradle_path)
         else:
-            logging.info("Not found in derived repo for: %s", repo_url)
+            logging.info("Force snippet prepared but not appended (use --force-apply)")
+            if args.debug:
+                logging.debug("\n\n%s\n\n", snippet)
 
-    # second pass: raw path checks if not found yet
-    if not found:
-        logging.info("Attempting raw path checks on repository URLs (fallback).")
-        for repo_url in repo_urls:
-            logging.debug("Raw-checking repo_url: %s", repo_url)
-            for ext in ('jar', 'pom'):
-                candidate = f"{repo_url.rstrip('/')}/{maven_coordinate_to_path(group_id, artifact_id, version, ext)}"
-                start = time.perf_counter()
-                try:
-                    resp, exc = try_head(candidate, auth=auth, timeout=10)
-                except Exception as e:
-                    resp, exc = None, e
-                elapsed = time.perf_counter() - start
-                status = resp.status_code if resp else None
-                logging.debug("Tried raw candidate: %s -> status=%s, exc=%s (%.3fs)", candidate, status, repr(exc) if exc else None, elapsed)
-                if resp is not None and resp.status_code == 200:
-                    found = True
-                    found_url = candidate
-                    logging.info("Artifact FOUND at (raw): %s", found_url)
-                    break
-            if found:
-                break
-
-    # result output
-    if found:
-        if args.verbose or args.debug:
-            print("True")
-            logging.info("Exiting with success (artifact found).")
-        else:
-            print(True)
-        raise SystemExit(0)
-    else:
-        logging.info("Artifact NOT FOUND in any repository listed.")
-        if args.verbose or args.debug:
-            print("False")
-        else:
-            print(False)
-        raise SystemExit(1)
+    logging.info("Remediation planning completed. Inspect the JSON summary above and logs.")
+    # Exit successful (returns 0) even if nothing applied, because script ran
+    raise SystemExit(0)
 
 if __name__ == "__main__":
     main()
