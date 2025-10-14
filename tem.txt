@@ -1,407 +1,330 @@
-#!/usr/bin/env python3
+# tools.py
 """
-bd_text_recommend_remediate.py
+Tools & handler for updating Gradle dependencies.
 
-Purpose:
-  - Read a text recommendation/report (file or inline text)
-  - Extract package names and recommended versions (if present)
-  - Collect Gradle dependencies (including transitive) for a module
-  - Match report items to Gradle coordinates (heuristics)
-  - Suggest remediation: direct update (if direct dep + version) or force override (transitive)
-  - Optionally apply direct edits and/or append force snippet (backups created)
+Primary class: UpdateDependencyToolHandler
+Method: update_dependency(request: dict) -> dict
 
-Usage (dry-run):
-  python bd_text_recommend_remediate.py \
-    --project-dir /path/to/module \
-    --gradle-exec ./gradlew \
-    --configs runtimeClasspath,compileClasspath \
-    --recommendation-file /path/to/report.txt \
-    --build-file build.gradle \
-    --debug
-
-Provide recommendation as a string:
-  python bd_text_recommend_remediate.py \
-    --project-dir . --recommendation-text "Focus on upgrading the Spring Framework and Netty Project components to versions with the fewest known vulnerabilities." \
-    --debug
-
-Apply edits:
-  python bd_text_recommend_remediate.py ... --apply --force-apply
-
-Notes:
- - This is a best-effort parser and uses heuristics. Always review changes before committing.
- - If recommendations do not include concrete versions, the script will mark them as review-required
-   (you can optionally integrate with BlackDuck/Maven Central to pick target versions).
+request keys (required):
+  - project_dir: str (absolute or relative path to repo root)
+  - old_dependency: str (group:artifact:version or group:artifact)
+  - new_dependency: str (group:artifact:version)  - recommended: include version
+Optional:
+  - gradle_exec: str (default "./gradlew" or "gradlew.bat" on Windows)
+  - configs: list[str] (default ["runtimeClasspath"])
+  - build_file: str (path relative to project_dir to prefer for edits)
+  - apply: bool (default False) -> actually write files
+  - force_apply: bool (default False) -> append resolutionStrategy.force snippet if needed
 """
 
-import argparse
-import logging
-import re
-import subprocess
-import json
 import os
+import re
+import time
+import shutil
+import logging
+import subprocess
 from pathlib import Path
-from shutil import copy2
-from typing import List, Tuple, Set, Dict
+from typing import Optional, List, Tuple, Dict, Set
 
-# -------------------------
-# Logging
-# -------------------------
-def setup_logging(debug: bool):
-    level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-# -------------------------
-# Gradle helpers
-# -------------------------
-COORD_REGEX = re.compile(r'([A-Za-z0-9_\-\.]+(?:\.[A-Za-z0-9_\-\.]+)*):([A-Za-z0-9_\-\.]+):([A-Za-z0-9_\-\.]+(?:[-A-Za-z0-9_\._]*))')
-VERSION_TOKEN = re.compile(r'(\d+(?:\.\d+)+(?:[A-Za-z0-9\.\-_]*))')  # e.g. 6.2.6 or 4.2.3.Final
+# Regex
+COORD_WITH_VER = re.compile(r'^(?P<g>[A-Za-z0-9_\-\.]+(?:\.[A-Za-z0-9_\-\.]+)*):(?P<a>[A-Za-z0-9_\-\.]+):(?P<v>[A-Za-z0-9_\-\.]+(?:[-A-Za-z0-9_\._]*))$')
+COORD_GA = re.compile(r'^(?P<g>[A-Za-z0-9_\-\.]+(?:\.[A-Za-z0-9_\-\.]+)*):(?P<a>[A-Za-z0-9_\-\.]+)$')
+COORD_FULL_FINDER = re.compile(r'([A-Za-z0-9_\-\.]+(?:\.[A-Za-z0-9_\-\.]+)*):([A-Za-z0-9_\-\.]+):([A-Za-z0-9_\-\.]+(?:[-A-Za-z0-9_\._]*))')
+
+DEPENDENCY_LINE_REGEX = re.compile(
+    r"(?P<prefix>^\s*(implementation|api|compile|compileOnly|runtimeOnly|runtime|testImplementation|testCompile|testRuntime)\s+['\"])" +
+    r"(?P<coord>[^'\"]+)['\"]", re.MULTILINE
+)
+
+def find_gradle_exec(project_dir: str, requested: str = "./gradlew") -> str:
+    """
+    Resolve a usable gradle executable. Tries:
+      - requested if absolute or relative inside project_dir
+      - gradlew.bat / gradlew in project_dir (or parents)
+      - 'gradle' (system)
+    Returns a string to use as executable in subprocess.run.
+    """
+    pdir = Path(project_dir)
+    cand = Path(requested)
+    if cand.is_absolute() and cand.exists():
+        return str(cand)
+    rel = pdir / requested
+    if rel.exists():
+        return str(rel)
+    # platform-specific wrappers
+    if os.name == 'nt':
+        bat = pdir / 'gradlew.bat'
+        if bat.exists():
+            return str(bat)
+    else:
+        sh = pdir / 'gradlew'
+        if sh.exists():
+            return str(sh)
+    # walk up a few parents
+    cur = pdir
+    for _ in range(6):
+        if (cur / 'gradlew.bat').exists():
+            return str(cur / 'gradlew.bat')
+        if (cur / 'gradlew').exists():
+            return str(cur / 'gradlew')
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return 'gradle'  # fallback
 
 def run_gradle_dependencies(project_dir: str, gradle_exec: str, configurations: List[str], timeout: int = 120) -> str:
+    """
+    Runs gradle dependencies for each configuration. Returns combined stdout (str).
+    """
     outputs = []
     for cfg in configurations:
         cmd = [gradle_exec, "dependencies", "--configuration", cfg]
         logging.info("Running: %s (cwd=%s)", " ".join(cmd), project_dir)
+        shell_flag = False
+        # on Windows, calling a .bat may require shell=True
+        if os.name == 'nt' and str(gradle_exec).lower().endswith('.bat'):
+            shell_flag = True
+            cmd = " ".join(cmd)
         try:
-            r = subprocess.run(cmd, cwd=project_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
-            outputs.append(r.stdout)
-            logging.debug("Gradle [%s] returncode=%s", cfg, r.returncode)
+            result = subprocess.run(cmd, cwd=project_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, timeout=timeout, shell=shell_flag)
+            outputs.append(result.stdout)
+            logging.debug("Gradle retcode=%s", result.returncode)
+        except FileNotFoundError as e:
+            logging.error("Gradle executable not found: %s", gradle_exec)
+            raise
+        except subprocess.TimeoutExpired as e:
+            logging.error("Gradle timed out: %s", e)
+            outputs.append(getattr(e, "stdout", "") or "")
         except Exception as e:
-            logging.exception("Gradle dependencies failed for %s: %s", cfg, e)
+            logging.exception("Gradle run error: %s", e)
     return "\n".join(outputs)
 
-def parse_coords_from_gradle_output(text: str) -> Set[Tuple[str,str,str]]:
+def parse_coords_from_gradle_text(text: str) -> Set[Tuple[str,str,str]]:
     coords = set()
-    for m in COORD_REGEX.finditer(text):
+    for m in COORD_FULL_FINDER.finditer(text):
         coords.add((m.group(1), m.group(2), m.group(3)))
-    logging.info("Parsed %d unique coordinates from Gradle output", len(coords))
     return coords
 
-# -------------------------
-# Recommendation text parsing
-# -------------------------
-# Recognize lines like: "Spring Framework    6.2.6    SEV-5" or sentences "Upgrade Spring Framework to 6.2.9"
-TABLE_ROW_SPLIT = re.compile(r'\s{2,}|\t|\|')  # split columns with multiple spaces, tabs, pipes
-CAP_NAME_RE = re.compile(r'([A-Z][A-Za-z0-9\-\._]+(?:\s+[A-Z][A-Za-z0-9\-\._]+)*)')  # sequences of Capitalized words
+def find_module_build_files(project_dir: str) -> List[Path]:
+    p = Path(project_dir)
+    build_files = []
+    for path in p.rglob('build.gradle'):
+        build_files.append(path)
+    for path in p.rglob('build.gradle.kts'):
+        build_files.append(path)
+    return sorted(build_files)
 
-def parse_recommendation_text(text: str):
-    """
-    Returns:
-      - rows: list of {'name': <str>, 'version': <str or None>, 'line': <original>}
-      - sentences: list of recommendation sentences (strings)
-    """
-    # Normalize
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    rows = []
-    sentences = []
-    # detect table-like rows with explicit version token
-    for ln in lines:
-        # if contains a version token somewhere, treat as table row
-        v = VERSION_TOKEN.search(ln)
-        if v:
-            ver = v.group(1)
-            parts = TABLE_ROW_SPLIT.split(ln)
-            # heuristic: left-most non-empty part is package name
-            name = None
-            for p in parts:
-                p = p.strip()
-                if not p:
-                    continue
-                # skip if p looks just like version
-                if VERSION_TOKEN.search(p) and p == ver:
-                    continue
-                name = p
-                break
-            if not name:
-                # fallback: text before version occurrence
-                idx = ln.find(ver)
-                name = ln[:idx].strip()
-            rows.append({'name': name, 'version': ver, 'line': ln})
-        else:
-            # check if sentence contains recommendation keywords
-            low = ln.lower()
-            if any(k in low for k in ('upgrade', 'recommended', 'recommend', 'remediation', 'priority', 'focus on upgrading', 'suggest')):
-                # possibly multiple sentences - split by .!? and keep relevant ones
-                for s in re.split(r'(?<=[\.\?\!])\s+', ln):
-                    if s.strip():
-                        sentences.append(s.strip())
-    # also split long paragraphs into sentences for recommendation detection
-    # (if no explicit lines found)
-    if not rows and not sentences:
-        for s in re.split(r'(?<=[\.\?\!])\s+', text):
-            if s.strip() and any(k in s.lower() for k in ('upgrade', 'recommend', 'remediation', 'priority', 'focus on')):
-                sentences.append(s.strip())
-    # additionally, from sentences try to extract package names and explicit version tokens
-    # e.g. "Focus on upgrading the Spring Framework and Netty Project components to versions with the fewest known vulnerabilities."
-    sent_extracted = []
-    for s in sentences:
-        # find version tokens in sentence
-        v = VERSION_TOKEN.search(s)
-        rec_ver = v.group(1) if v else None
-        # attempt to extract package names: sequences of Capitalized words
-        names = CAP_NAME_RE.findall(s)
-        # filter out generic words and short words
-        filtered = []
-        for nm in names:
-            nm = nm.strip()
-            if len(nm) < 3:
-                continue
-            # skip if appears to be start of sentence 'Focus' etc
-            if nm.lower() in ('focus', 'priority', 'recommendation', 'recommendations', 'regular', 'scanning'):
-                continue
-            filtered.append(nm)
-        if filtered:
-            for nm in filtered:
-                sent_extracted.append({'name': nm, 'recommended_version': rec_ver, 'sentence': s})
-        else:
-            # no capitalized names; maybe package names are lowercase words like 'logback' — try token matching by common package tokens
-            tokens = re.findall(r'\b[a-zA-Z0-9\-\._]{3,}\b', s)
-            # heuristic: pick tokens that are not stopwords and longer than 3
-            stop = {'the','and','to','with','for','of','in','on','be','is','are'}
-            tokens = [t for t in tokens if t.lower() not in stop and not t.isdigit()]
-            if tokens:
-                sent_extracted.append({'name': tokens[0], 'recommended_version': rec_ver, 'sentence': s})
-    # Merge table rows + sentence-extracted items (avoid duplicates)
-    items = rows[:]
-    for se in sent_extracted:
-        # avoid duplicates by name+version
-        duplicate = False
-        for r in items:
-            if r['name'] and se['name'] and r['name'].lower() == se['name'].lower():
-                duplicate = True
-                # if r lacks version but se has recommended version, attach it as 'recommended_version'
-                if 'recommended_version' not in r and se.get('recommended_version'):
-                    r['recommended_version'] = se['recommended_version']
-                break
-        if not duplicate:
-            items.append({'name': se['name'], 'version': None, 'recommended_version': se.get('recommended_version'), 'line': se.get('sentence')})
-    # normalize keys: ensure each dict has 'name', maybe 'version' and 'recommended_version'
-    normalized = []
-    for it in items:
-        normalized.append({
-            'name': it.get('name'),
-            'package_version': it.get('version') or None,
-            'recommended_version': it.get('recommended_version') or None,
-            'line': it.get('line')
-        })
-    return normalized, sentences
-
-# -------------------------
-# Matching heuristics
-# -------------------------
-def match_report_items_to_coords(report_items: List[Dict], coords: Set[Tuple[str,str,str]]):
-    """
-    For each report item (package_name, package_version, recommended_version) attempt to match to coords.
-    Returns mapping idx -> list of coords matched.
-    """
-    mapping = {}
-    coord_list = list(coords)
-    for idx, item in enumerate(report_items):
-        pkg = (item.get('name') or item.get('package_name') or "").lower()
-        pkg_ver = (item.get('package_version') or "").lower() if item.get('package_version') else None
-        rec_ver = (item.get('recommended_version') or "").lower() if item.get('recommended_version') else None
-        matches = []
-        for g,a,v in coord_list:
-            # exact artifact match
-            if pkg_ver and v.lower() == pkg_ver and (a.lower() in pkg or pkg in a.lower() or g.split('.')[-1].lower() in pkg):
-                matches.append((g,a,v))
-                continue
-            # artifact substring match
-            if a.lower() in pkg or pkg in a.lower():
-                matches.append((g,a,v))
-                continue
-            # group fragment match
-            if g.split('.')[-1].lower() in pkg:
-                matches.append((g,a,v))
-                continue
-        mapping[idx] = matches
-    return mapping
-
-# -------------------------
-# build.gradle edit helpers
-# -------------------------
-DEPENDENCY_LINE_REGEX = re.compile(r"(?P<prefix>^\s*(implementation|api|compile|compileOnly|runtimeOnly|testImplementation|testCompile|testRuntime)\s+['\"])(?P<coord>[^'\"]+)['\"]", re.MULTILINE)
-
-def find_direct_dependency_lines(build_gradle_path: Path, target_ga: str):
-    """
-    Returns True if build.gradle contains explicit dependency that starts with target group:artifact:
-    """
-    if not build_gradle_path.exists():
+def is_direct_dependency_in_file(build_file: Path, group: str, artifact: str) -> bool:
+    try:
+        text = build_file.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
         return False
-    text = build_gradle_path.read_text(encoding='utf-8')
-    return bool(re.search(re.escape(target_ga) + r":[^'\"]+", text))
+    # group:artifact:version or group:artifact:*
+    if re.search(re.escape(f"{group}:{artifact}") + r":[A-Za-z0-9\.\-_]+", text):
+        return True
+    # other forms: group: 'org', name: 'artifact'
+    if re.search(rf"group\s*:\s*['\"]{re.escape(group)}['\"].*name\s*:\s*['\"]{re.escape(artifact)}['\"]", text, re.DOTALL):
+        return True
+    return False
 
-def apply_direct_updates_to_build_gradle(build_gradle_path: Path, replacements: Dict[str,str], backup: bool = True) -> int:
+def apply_direct_updates_to_file(build_file: Path, replacements: Dict[str,str]) -> int:
     """
-    replacements: mapping old_full_coord (g:a:oldver) -> new_full_coord (g:a:newver)
+    Replace direct dependency coordinate strings in the given build_file.
+    replacements: map old_full_coord -> new_full_coord
+    Returns number replaced.
     """
-    if not build_gradle_path.exists():
-        logging.error("build.gradle not found: %s", build_gradle_path)
-        return 0
-    text = build_gradle_path.read_text(encoding='utf-8')
-    if backup:
-        bkp = build_gradle_path.with_suffix(build_gradle_path.suffix + f".bak")
-        copy2(build_gradle_path, bkp)
-        logging.info("Backup created: %s", bkp)
-    applied = 0
+    text = build_file.read_text(encoding='utf-8', errors='ignore')
+    # backup
+    bak = build_file.with_suffix(build_file.suffix + f".bak.{int(time.time())}")
+    shutil.copy2(build_file, bak)
+    logging.info("Backup created: %s", bak)
+    replaced = 0
+
     def repl(m):
-        nonlocal applied
+        nonlocal replaced
         prefix = m.group('prefix')
         coord = m.group('coord').strip()
         for old, new in replacements.items():
-            # if exact match
             if coord == old:
-                applied += 1
-                logging.debug("Replacing exact %s -> %s", old, new)
+                replaced += 1
+                logging.debug("Replacing exact %s -> %s in %s", old, new, build_file)
                 return f"{prefix}{new}'"
-            # if group:artifact matches and we want to change version
-            old_ga = ':'.join(old.split(':')[:2])
+            old_ga = ":".join(old.split(":")[:2])
             if coord.startswith(old_ga + ":"):
-                applied += 1
-                logging.debug("Replacing %s -> %s", coord, new)
+                replaced += 1
+                logging.debug("Replacing %s -> %s in %s", coord, new, build_file)
                 return f"{prefix}{new}'"
         return m.group(0)
+
     new_text = DEPENDENCY_LINE_REGEX.sub(repl, text)
-    if applied > 0:
-        build_gradle_path.write_text(new_text, encoding='utf-8')
-        logging.info("Applied %d replacements to %s", applied, build_gradle_path)
+    if replaced:
+        build_file.write_text(new_text, encoding='utf-8')
+        logging.info("Applied %d replacements to %s", replaced, build_file)
     else:
-        logging.info("No replacements applied to %s", build_gradle_path)
-    return applied
+        logging.info("No matches to replace in %s", build_file)
+    return replaced
 
 def generate_force_snippet(forces: Dict[str,str]) -> str:
     lines = [
-        "// BEGIN bd_text_recommend_remediate generated force snippet",
+        "// BEGIN updateDependency autogenerated force snippet",
         "configurations.all {",
-        "    resolutionStrategy {",
-        "        force("]
-    for i,(ga,full) in enumerate(forces.items()):
-        lines.append(f'            "{full}"{"," if i < len(forces)-1 else ""}')
-    lines.append("        )")
-    lines.append("    }")
-    lines.append("}")
-    lines.append("// END bd_text_recommend_remediate generated force snippet")
+        "  resolutionStrategy {",
+        "    force("
+    ]
+    items = list(forces.values())
+    for i, full in enumerate(items):
+        lines.append(f'      "{full}"{"," if i < len(items)-1 else ""}')
+    lines.extend([
+        "    )",
+        "  }",
+        "}",
+        "// END updateDependency autogenerated force snippet"
+    ])
     return "\n".join(lines)
 
-# -------------------------
-# Main workflow
-# -------------------------
-def main():
-    parser = argparse.ArgumentParser(description="Apply remediation based on textual recommendation/report")
-    parser.add_argument("--project-dir", "-d", required=True, help="Path to module (working dir for gradle).")
-    parser.add_argument("--gradle-exec", default="./gradlew", help="./gradlew or gradle")
-    parser.add_argument("--configs", default="runtimeClasspath", help="Comma-separated gradle configurations")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--recommendation-file", help="Path to a text report file containing recommendations")
-    group.add_argument("--recommendation-text", help="Inline recommendation text (quoted)")
-    parser.add_argument("--build-file", default="build.gradle", help="build.gradle relative to project-dir")
-    parser.add_argument("--apply", action="store_true", help="Apply direct dependency updates to build.gradle (backup created)")
-    parser.add_argument("--force-apply", action="store_true", help="Append resolutionStrategy.force snippet if transitive remediations exist")
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
+class UpdateDependencyToolHandler:
+    def __init__(self, logger: Optional[logging.Logger] = None):
+        self.logger = logger or logging.getLogger(__name__)
 
-    setup_logging(args.debug)
+    def _normalize_coords(self, s: str) -> Tuple[str, str, Optional[str]]:
+        s = s.strip()
+        m = COORD_WITH_VER.match(s)
+        if m:
+            return m.group('g'), m.group('a'), m.group('v')
+        m2 = COORD_GA.match(s)
+        if m2:
+            return m2.group('g'), m2.group('a'), None
+        raise ValueError(f"Invalid coordinate format: {s}")
 
-    # 1. collect gradle coordinates
-    project_dir = args.project_dir
-    gradle_exec = args.gradle_exec
-    configs = [c.strip() for c in args.configs.split(',') if c.strip()]
-    gradle_output = run_gradle_dependencies(project_dir, gradle_exec, configs)
-    coords = parse_coords_from_gradle_output(gradle_output)
-    if not coords:
-        logging.error("No Gradle dependencies parsed; aborting.")
-        raise SystemExit(2)
+    def update_dependency(self, request: Dict) -> Dict:
+        project_dir = request.get('project_dir')
+        old_dep = request.get('old_dependency')
+        new_dep = request.get('new_dependency')
+        gradle_exec_req = request.get('gradle_exec', './gradlew')
+        configs = request.get('configs', ['runtimeClasspath'])
+        apply_changes = bool(request.get('apply', False))
+        force_apply = bool(request.get('force_apply', False))
+        requested_build_file = request.get('build_file')
 
-    # 2. read recommendation text
-    if args.recommendation_file:
-        rec_text = Path(args.recommendation_file).read_text(encoding='utf-8', errors='ignore')
-    else:
-        rec_text = args.recommendation_text
+        if not project_dir or not old_dep or not new_dep:
+            raise ValueError("project_dir, old_dependency and new_dependency are required")
 
-    report_items, sentences = parse_recommendation_text(rec_text)
-    logging.info("Parsed %d report items and %d recommendation sentences", len(report_items), len(sentences))
-    if args.debug:
-        logging.debug("Report items sample: %s", report_items[:40])
-        logging.debug("Sentences: %s", sentences[:40])
+        project_dir = str(Path(project_dir).resolve())
+        self.logger.info("Request: project_dir=%s old=%s new=%s", project_dir, old_dep, new_dep)
 
-    # 3. match to coords
-    mapping = match_report_items_to_coords(report_items, coords)
+        # normalize
+        try:
+            old_g, old_a, old_v = self._normalize_coords(old_dep)
+            new_g, new_a, new_v = self._normalize_coords(new_dep)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
 
-    # 4. plan remediations
-    direct_replacements = {}  # old coord -> new coord
-    forces = {}  # group:artifact -> full coord
-    details = []
-    build_gradle_path = Path(project_dir) / args.build_file
+        gradle_exec = find_gradle_exec(project_dir, gradle_exec_req)
+        self.logger.info("Using gradle executable: %s", gradle_exec)
 
-    for idx, item in enumerate(report_items):
-        pkg_name = item.get('name') or item.get('package_name') or ""
-        pkg_ver = item.get('package_version') or None
-        rec_ver = item.get('recommended_version') or None
-        matches = mapping.get(idx, [])
-        if not matches:
-            details.append({'item': item, 'matches': [], 'action': 'no-match', 'note': 'manual review required'})
-            continue
-        for (g,a,v) in matches:
-            current_full = f"{g}:{a}:{v}"
-            # decide recommended target
-            recommended_full = None
-            recommended_version_extracted = None
-            if rec_ver:
-                # rec_ver might be full like '6.2.9' or have 'Final' suffix - keep as-is
-                recommended_version_extracted = rec_ver
+        # run gradle dependencies (best-effort)
+        gradle_text = ""
+        try:
+            gradle_text = run_gradle_dependencies(project_dir, gradle_exec, configs)
+        except FileNotFoundError:
+            return {"ok": False, "error": f"Gradle executable not found: {gradle_exec}"}
+        except Exception as e:
+            self.logger.exception("Gradle dependencies error: %s", e)
+
+        coords = parse_coords_from_gradle_text(gradle_text)
+        self.logger.info("Parsed %d coords from Gradle output", len(coords))
+
+        build_files = find_module_build_files(project_dir)
+        self.logger.info("Found %d build files", len(build_files))
+
+        # find direct declarations
+        direct_matches = []
+        for bf in build_files:
+            if is_direct_dependency_in_file(bf, old_g, old_a):
+                direct_matches.append(bf)
+
+        # prefer requested build_file
+        preferred = None
+        if requested_build_file:
+            cand = Path(project_dir) / requested_build_file
+            if cand.exists():
+                preferred = cand
+                if cand not in direct_matches:
+                    direct_matches.insert(0, cand)
+
+        result = {
+            "ok": True,
+            "old": f"{old_g}:{old_a}:{old_v}" if old_v else f"{old_g}:{old_a}",
+            "new": f"{new_g}:{new_a}:{new_v}" if new_v else f"{new_g}:{new_a}",
+            "direct_matches": [str(p) for p in direct_matches],
+            "applied": False,
+            "actions": []
+        }
+
+        # plan direct replacements
+        direct_replacements: Dict[str,str] = {}
+        if direct_matches:
+            if old_v:
+                old_full = f"{old_g}:{old_a}:{old_v}"
+                new_full = f"{new_g}:{new_a}:{new_v or old_v}"
+                direct_replacements[old_full] = new_full
             else:
-                # if item itself had package_version but not recommended, we treat as current only
-                recommended_version_extracted = None
-            # If recommended_version_extracted exists and differs, decide direct vs force
-            if recommended_version_extracted and recommended_version_extracted != v:
-                recommended_full = f"{g}:{a}:{recommended_version_extracted}"
-                is_direct = find_direct_dependency_lines(build_gradle_path, f"{g}:{a}") if build_gradle_path.exists() else False
-                if is_direct:
-                    direct_replacements[current_full] = recommended_full
-                    action = f"direct-update -> {recommended_full}"
-                else:
-                    forces[f"{g}:{a}"] = recommended_full
-                    action = f"force-override -> {recommended_full}"
+                # locate version occurrences in each file and propose replace
+                for bf in direct_matches:
+                    try:
+                        txt = bf.read_text(encoding='utf-8', errors='ignore')
+                    except Exception:
+                        txt = ""
+                    for m in re.finditer(re.escape(f"{old_g}:{old_a}") + r":([A-Za-z0-9\.\-_]+)", txt):
+                        found = m.group(1)
+                        old_full = f"{old_g}:{old_a}:{found}"
+                        new_ver = new_v if new_v else found
+                        direct_replacements[old_full] = f"{new_g}:{new_a}:{new_ver}"
+
+        if direct_replacements:
+            result['planned_direct_replacements'] = direct_replacements
+            if apply_changes:
+                total = 0
+                for bf in direct_matches:
+                    applied = apply_direct_updates_to_file(bf, direct_replacements)
+                    total += applied
+                    if applied:
+                        result['actions'].append({"type": "direct_update", "file": str(bf), "applied": applied})
+                result['applied'] = total > 0
             else:
-                # no recommended version present -> review required
-                action = "review-required (no explicit recommended version found)"
-            details.append({'item': item, 'matched_coord': current_full, 'action': action, 'recommended_full': recommended_full})
+                result['actions'].append({"type": "direct_update_plan", "replacements": direct_replacements})
 
-    # 5. output summary
-    summary = {
-        'scanned_coords': len(coords),
-        'report_items': len(report_items),
-        'direct_replacements_count': len(direct_replacements),
-        'force_overrides_count': len(forces),
-        'details_sample': details[:200]
-    }
-    print(json.dumps(summary, indent=2))
-
-    # 6. apply changes if requested
-    if args.apply and direct_replacements:
-        applied = apply_direct_updates_to_build_gradle(build_gradle_path, direct_replacements, backup=True)
-        logging.info("Applied %d direct replacements", applied)
-    elif direct_replacements:
-        logging.info("Direct replacements prepared but not applied (use --apply)")
-
-    if forces:
-        snippet = generate_force_snippet(forces)
-        if args.force_apply:
-            if build_gradle_path.exists():
-                bkp = build_gradle_path.with_suffix(build_gradle_path.suffix + ".forcebak")
-                copy2(build_gradle_path, bkp)
-                with open(build_gradle_path, 'a', encoding='utf-8') as f:
-                    f.write("\n\n" + snippet + "\n")
-                logging.info("Appended force snippet to %s", build_gradle_path)
-            else:
-                logging.error("Cannot append force snippet; build.gradle not found at %s", build_gradle_path)
+        # prepare force overrides for transitive or if user asked
+        forces: Dict[str,str] = {}
+        if new_v:
+            forces[f"{old_g}:{old_a}"] = f"{old_g}:{old_a}:{new_v}"
         else:
-            logging.info("Force snippet prepared but not appended (use --force-apply)")
-            if args.debug:
-                logging.debug("\n\n%s\n\n", snippet)
+            self.logger.info("No new version supplied, skipping force generation")
 
-    logging.info("Remediation planning completed. Inspect the JSON summary above and logs.")
-    # Exit successful (returns 0) even if nothing applied, because script ran
-    raise SystemExit(0)
+        if forces:
+            result['planned_forces'] = forces
+            if apply_changes and force_apply:
+                # append to root build.gradle or first module build
+                root_build = Path(project_dir) / 'build.gradle'
+                if not root_build.exists() and build_files:
+                    root_build = build_files[0]
+                if root_build.exists():
+                    bak = root_build.with_suffix(root_build.suffix + f".forcebak.{int(time.time())}")
+                    shutil.copy2(root_build, bak)
+                    snippet = generate_force_snippet(forces)
+                    with open(root_build, 'a', encoding='utf-8') as fh:
+                        fh.write("\n\n" + snippet + "\n")
+                    result['actions'].append({"type": "force_append", "file": str(root_build), "snippet": snippet})
+                    result['applied'] = True
+                else:
+                    result['actions'].append({"type": "force_append_failed", "reason": "no build.gradle found"})
+            else:
+                result['actions'].append({"type": "force_plan", "forces": forces})
 
-if __name__ == "__main__":
-    main()
+        if not direct_replacements and not forces:
+            result['note'] = "No direct replacements or forces planned - manual review or missing concrete version"
+
+        return result
