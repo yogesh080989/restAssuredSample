@@ -1,0 +1,37 @@
+name: Render & Publish C4 Diagrams
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'diagrams/**/*.puml'
+      - '.github/workflows/publish-c4.yml'
+      - 'scripts/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Render PlantUML to SVG
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD:/data" plantuml/plantuml -tsvg /data/diagrams/*.puml -o /data/out
+
+      - name: List outputs
+        run: ls -al out
+
+      - name: Upload to Confluence
+        uses: actions/setup-python@v5
+      - name: Install deps
+        run: pip install requests
+      - name: Publish
+        env:
+          CONFLUENCE_BASE:  ${{ secrets.CONFLUENCE_BASE }}   # e.g. https://your-domain.atlassian.net/wiki
+          CONFLUENCE_EMAIL: ${{ secrets.CONFLUENCE_EMAIL }}  # your Atlassian account email
+          CONFLUENCE_TOKEN: ${{ secrets.CONFLUENCE_TOKEN }}  # API token
+          CONFLUENCE_PAGE_ID: ${{ secrets.CONFLUENCE_PAGE_ID }}
+        run: |
+          python scripts/publish_to_confluence.py out

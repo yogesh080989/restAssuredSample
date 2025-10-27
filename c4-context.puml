@@ -1,0 +1,67 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+' People
+Person(sre, "SRE / DevOps Team")
+Person(biz, "Business User / Approver")
+Person(qa,  "QA Team")
+
+' Our system
+System(srep, "SREP Application", "Primary application")
+
+' External systems – Data & Monitoring Sources
+System_Ext(snw,  "ServiceNow")
+System_Ext(spl,  "Splunk")
+System_Ext(apd,  "AppDynamics")
+System_Ext(prom, "Prometheus")
+System_Ext(dbs,  "Enterprise Databases")
+System_Ext(file, "Network File Share")
+
+' External systems – Integration & Action Systems
+System_Ext(auth, "Authentication Services")
+System_Ext(ans,  "Ansible Tower AAP")
+System_Ext(ame,  "Amelia")
+System_Ext(jira, "Jira")
+System_Ext(email,"Email System")
+System_Ext(llm,  "LLM Service")
+System_Ext(lb,   "Load Balancers")
+System_Ext(tab,  "Tableau")
+
+' External systems – CI/CD & SCM
+System_Ext(scm, "Source Control (Git)")
+System_Ext(ci,  "CI/CD Orchestrators")
+System_Ext(art, "Artifactory")
+System_Ext(scan,"Code Scanners")
+
+' Relationships (Users)
+Rel(sre, srep, "Operates / uses")
+Rel(biz, srep, "Approves / uses")
+Rel(qa,  srep, "Tests")
+
+' Data flows
+Rel(srep, auth, "AuthN/AuthZ")
+Rel(srep, snw,  "Tickets / Change data")
+Rel(srep, spl,  "Logs / Metrics")
+Rel(srep, apd,  "APM telemetry")
+Rel(srep, prom, "Metrics / Alerts")
+Rel(srep, dbs,  "Read/Write")
+Rel(srep, file, "Batch files")
+
+' Action integrations
+Rel(srep, ans,  "Runbooks / Jobs")
+Rel(srep, ame,  "Virtual agent")
+Rel(srep, jira, "Issues")
+Rel(srep, email,"Notifications")
+Rel(srep, llm,  "AI calls")
+Rel(srep, lb,   "Ingress / routing")
+Rel(srep, tab,  "Analytics exports")
+
+' CI/CD chain
+Rel(sre,  scm,  "Commit / PR")
+Rel(scm,  ci,   "Pipelines")
+Rel(ci,   scan, "SAST/DAST")
+Rel(ci,   art,  "Builds / Artifacts")
+Rel(ci,   srep, "Deploy")
+
+SHOW_LEGEND()
+@enduml
