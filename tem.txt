@@ -1,330 +1,139 @@
-# tools.py
-"""
-Tools & handler for updating Gradle dependencies.
+Follow these steps strictly:
 
-Primary class: UpdateDependencyToolHandler
-Method: update_dependency(request: dict) -> dict
+1. Understand the microservice
 
-request keys (required):
-  - project_dir: str (absolute or relative path to repo root)
-  - old_dependency: str (group:artifact:version or group:artifact)
-  - new_dependency: str (group:artifact:version)  - recommended: include version
-Optional:
-  - gradle_exec: str (default "./gradlew" or "gradlew.bat" on Windows)
-  - configs: list[str] (default ["runtimeClasspath"])
-  - build_file: str (path relative to project_dir to prefer for edits)
-  - apply: bool (default False) -> actually write files
-  - force_apply: bool (default False) -> append resolutionStrategy.force snippet if needed
-"""
+Extract:
 
-import os
-import re
-import time
-import shutil
-import logging
-import subprocess
-from pathlib import Path
-from typing import Optional, List, Tuple, Dict, Set
+Main responsibilities
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+All REST endpoints (HTTP method + path)
 
-# Regex
-COORD_WITH_VER = re.compile(r'^(?P<g>[A-Za-z0-9_\-\.]+(?:\.[A-Za-z0-9_\-\.]+)*):(?P<a>[A-Za-z0-9_\-\.]+):(?P<v>[A-Za-z0-9_\-\.]+(?:[-A-Za-z0-9_\._]*))$')
-COORD_GA = re.compile(r'^(?P<g>[A-Za-z0-9_\-\.]+(?:\.[A-Za-z0-9_\-\.]+)*):(?P<a>[A-Za-z0-9_\-\.]+)$')
-COORD_FULL_FINDER = re.compile(r'([A-Za-z0-9_\-\.]+(?:\.[A-Za-z0-9_\-\.]+)*):([A-Za-z0-9_\-\.]+):([A-Za-z0-9_\-\.]+(?:[-A-Za-z0-9_\._]*))')
+All external dependencies (DB, message queues, services, caches, third-party APIs)
 
-DEPENDENCY_LINE_REGEX = re.compile(
-    r"(?P<prefix>^\s*(implementation|api|compile|compileOnly|runtimeOnly|runtime|testImplementation|testCompile|testRuntime)\s+['\"])" +
-    r"(?P<coord>[^'\"]+)['\"]", re.MULTILINE
-)
+Internal layers (Controllers, Services, Repositories, Adapters, Jobs)
 
-def find_gradle_exec(project_dir: str, requested: str = "./gradlew") -> str:
-    """
-    Resolve a usable gradle executable. Tries:
-      - requested if absolute or relative inside project_dir
-      - gradlew.bat / gradlew in project_dir (or parents)
-      - 'gradle' (system)
-    Returns a string to use as executable in subprocess.run.
-    """
-    pdir = Path(project_dir)
-    cand = Path(requested)
-    if cand.is_absolute() and cand.exists():
-        return str(cand)
-    rel = pdir / requested
-    if rel.exists():
-        return str(rel)
-    # platform-specific wrappers
-    if os.name == 'nt':
-        bat = pdir / 'gradlew.bat'
-        if bat.exists():
-            return str(bat)
-    else:
-        sh = pdir / 'gradlew'
-        if sh.exists():
-            return str(sh)
-    # walk up a few parents
-    cur = pdir
-    for _ in range(6):
-        if (cur / 'gradlew.bat').exists():
-            return str(cur / 'gradlew.bat')
-        if (cur / 'gradlew').exists():
-            return str(cur / 'gradlew')
-        if cur.parent == cur:
-            break
-        cur = cur.parent
-    return 'gradle'  # fallback
+Configuration that indicates integration points
 
-def run_gradle_dependencies(project_dir: str, gradle_exec: str, configurations: List[str], timeout: int = 120) -> str:
-    """
-    Runs gradle dependencies for each configuration. Returns combined stdout (str).
-    """
-    outputs = []
-    for cfg in configurations:
-        cmd = [gradle_exec, "dependencies", "--configuration", cfg]
-        logging.info("Running: %s (cwd=%s)", " ".join(cmd), project_dir)
-        shell_flag = False
-        # on Windows, calling a .bat may require shell=True
-        if os.name == 'nt' and str(gradle_exec).lower().endswith('.bat'):
-            shell_flag = True
-            cmd = " ".join(cmd)
-        try:
-            result = subprocess.run(cmd, cwd=project_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, timeout=timeout, shell=shell_flag)
-            outputs.append(result.stdout)
-            logging.debug("Gradle retcode=%s", result.returncode)
-        except FileNotFoundError as e:
-            logging.error("Gradle executable not found: %s", gradle_exec)
-            raise
-        except subprocess.TimeoutExpired as e:
-            logging.error("Gradle timed out: %s", e)
-            outputs.append(getattr(e, "stdout", "") or "")
-        except Exception as e:
-            logging.exception("Gradle run error: %s", e)
-    return "\n".join(outputs)
+2. Identify components
 
-def parse_coords_from_gradle_text(text: str) -> Set[Tuple[str,str,str]]:
-    coords = set()
-    for m in COORD_FULL_FINDER.finditer(text):
-        coords.add((m.group(1), m.group(2), m.group(3)))
-    return coords
+Group them into meaningful architectural components:
 
-def find_module_build_files(project_dir: str) -> List[Path]:
-    p = Path(project_dir)
-    build_files = []
-    for path in p.rglob('build.gradle'):
-        build_files.append(path)
-    for path in p.rglob('build.gradle.kts'):
-        build_files.append(path)
-    return sorted(build_files)
+ApiController / Controller components (all inbound APIs)
 
-def is_direct_dependency_in_file(build_file: Path, group: str, artifact: str) -> bool:
-    try:
-        text = build_file.read_text(encoding='utf-8', errors='ignore')
-    except Exception:
-        return False
-    # group:artifact:version or group:artifact:*
-    if re.search(re.escape(f"{group}:{artifact}") + r":[A-Za-z0-9\.\-_]+", text):
-        return True
-    # other forms: group: 'org', name: 'artifact'
-    if re.search(rf"group\s*:\s*['\"]{re.escape(group)}['\"].*name\s*:\s*['\"]{re.escape(artifact)}['\"]", text, re.DOTALL):
-        return True
-    return False
+Service components (business logic)
 
-def apply_direct_updates_to_file(build_file: Path, replacements: Dict[str,str]) -> int:
-    """
-    Replace direct dependency coordinate strings in the given build_file.
-    replacements: map old_full_coord -> new_full_coord
-    Returns number replaced.
-    """
-    text = build_file.read_text(encoding='utf-8', errors='ignore')
-    # backup
-    bak = build_file.with_suffix(build_file.suffix + f".bak.{int(time.time())}")
-    shutil.copy2(build_file, bak)
-    logging.info("Backup created: %s", bak)
-    replaced = 0
+Repository components (data access)
 
-    def repl(m):
-        nonlocal replaced
-        prefix = m.group('prefix')
-        coord = m.group('coord').strip()
-        for old, new in replacements.items():
-            if coord == old:
-                replaced += 1
-                logging.debug("Replacing exact %s -> %s in %s", old, new, build_file)
-                return f"{prefix}{new}'"
-            old_ga = ":".join(old.split(":")[:2])
-            if coord.startswith(old_ga + ":"):
-                replaced += 1
-                logging.debug("Replacing %s -> %s in %s", coord, new, build_file)
-                return f"{prefix}{new}'"
-        return m.group(0)
+ClientAdapter / Gateway components (HTTP clients to external services)
 
-    new_text = DEPENDENCY_LINE_REGEX.sub(repl, text)
-    if replaced:
-        build_file.write_text(new_text, encoding='utf-8')
-        logging.info("Applied %d replacements to %s", replaced, build_file)
-    else:
-        logging.info("No matches to replace in %s", build_file)
-    return replaced
+EventProducer / EventConsumer components (Kafka, RabbitMQ)
 
-def generate_force_snippet(forces: Dict[str,str]) -> str:
-    lines = [
-        "// BEGIN updateDependency autogenerated force snippet",
-        "configurations.all {",
-        "  resolutionStrategy {",
-        "    force("
-    ]
-    items = list(forces.values())
-    for i, full in enumerate(items):
-        lines.append(f'      "{full}"{"," if i < len(items)-1 else ""}')
-    lines.extend([
-        "    )",
-        "  }",
-        "}",
-        "// END updateDependency autogenerated force snippet"
-    ])
-    return "\n".join(lines)
+Scheduler components (cron jobs)
 
-class UpdateDependencyToolHandler:
-    def __init__(self, logger: Optional[logging.Logger] = None):
-        self.logger = logger or logging.getLogger(__name__)
+Any utility or workflow/orchestration components
 
-    def _normalize_coords(self, s: str) -> Tuple[str, str, Optional[str]]:
-        s = s.strip()
-        m = COORD_WITH_VER.match(s)
-        if m:
-            return m.group('g'), m.group('a'), m.group('v')
-        m2 = COORD_GA.match(s)
-        if m2:
-            return m2.group('g'), m2.group('a'), None
-        raise ValueError(f"Invalid coordinate format: {s}")
+Each component must include:
 
-    def update_dependency(self, request: Dict) -> Dict:
-        project_dir = request.get('project_dir')
-        old_dep = request.get('old_dependency')
-        new_dep = request.get('new_dependency')
-        gradle_exec_req = request.get('gradle_exec', './gradlew')
-        configs = request.get('configs', ['runtimeClasspath'])
-        apply_changes = bool(request.get('apply', False))
-        force_apply = bool(request.get('force_apply', False))
-        requested_build_file = request.get('build_file')
+1-line responsibility
 
-        if not project_dir or not old_dep or not new_dep:
-            raise ValueError("project_dir, old_dependency and new_dependency are required")
+Key interfaces (endpoints or APIs used)
 
-        project_dir = str(Path(project_dir).resolve())
-        self.logger.info("Request: project_dir=%s old=%s new=%s", project_dir, old_dep, new_dep)
+Technology (Spring Boot, Node.js, .NET, etc.)
 
-        # normalize
-        try:
-            old_g, old_a, old_v = self._normalize_coords(old_dep)
-            new_g, new_a, new_v = self._normalize_coords(new_dep)
-        except ValueError as e:
-            return {"ok": False, "error": str(e)}
+3. Relationships
 
-        gradle_exec = find_gradle_exec(project_dir, gradle_exec_req)
-        self.logger.info("Using gradle executable: %s", gradle_exec)
+For every component:
 
-        # run gradle dependencies (best-effort)
-        gradle_text = ""
-        try:
-            gradle_text = run_gradle_dependencies(project_dir, gradle_exec, configs)
-        except FileNotFoundError:
-            return {"ok": False, "error": f"Gradle executable not found: {gradle_exec}"}
-        except Exception as e:
-            self.logger.exception("Gradle dependencies error: %s", e)
+Show “calls”, “reads/writes”, “publishes”, or “subscribes-to”
 
-        coords = parse_coords_from_gradle_text(gradle_text)
-        self.logger.info("Parsed %d coords from Gradle output", len(coords))
+Represent external systems explicitly
 
-        build_files = find_module_build_files(project_dir)
-        self.logger.info("Found %d build files", len(build_files))
+Use proper C4 direction arrows (from caller → callee)
 
-        # find direct declarations
-        direct_matches = []
-        for bf in build_files:
-            if is_direct_dependency_in_file(bf, old_g, old_a):
-                direct_matches.append(bf)
+4. Output Structurizr DSL
 
-        # prefer requested build_file
-        preferred = None
-        if requested_build_file:
-            cand = Path(project_dir) / requested_build_file
-            if cand.exists():
-                preferred = cand
-                if cand not in direct_matches:
-                    direct_matches.insert(0, cand)
+Generate Structurizr DSL containing:
 
-        result = {
-            "ok": True,
-            "old": f"{old_g}:{old_a}:{old_v}" if old_v else f"{old_g}:{old_a}",
-            "new": f"{new_g}:{new_a}:{new_v}" if new_v else f"{new_g}:{new_a}",
-            "direct_matches": [str(p) for p in direct_matches],
-            "applied": False,
-            "actions": []
-        }
+Workspace setup
 
-        # plan direct replacements
-        direct_replacements: Dict[str,str] = {}
-        if direct_matches:
-            if old_v:
-                old_full = f"{old_g}:{old_a}:{old_v}"
-                new_full = f"{new_g}:{new_a}:{new_v or old_v}"
-                direct_replacements[old_full] = new_full
-            else:
-                # locate version occurrences in each file and propose replace
-                for bf in direct_matches:
-                    try:
-                        txt = bf.read_text(encoding='utf-8', errors='ignore')
-                    except Exception:
-                        txt = ""
-                    for m in re.finditer(re.escape(f"{old_g}:{old_a}") + r":([A-Za-z0-9\.\-_]+)", txt):
-                        found = m.group(1)
-                        old_full = f"{old_g}:{old_a}:{found}"
-                        new_ver = new_v if new_v else found
-                        direct_replacements[old_full] = f"{new_g}:{new_a}:{new_ver}"
+Model
 
-        if direct_replacements:
-            result['planned_direct_replacements'] = direct_replacements
-            if apply_changes:
-                total = 0
-                for bf in direct_matches:
-                    applied = apply_direct_updates_to_file(bf, direct_replacements)
-                    total += applied
-                    if applied:
-                        result['actions'].append({"type": "direct_update", "file": str(bf), "applied": applied})
-                result['applied'] = total > 0
-            else:
-                result['actions'].append({"type": "direct_update_plan", "replacements": direct_replacements})
+Container for the API application
 
-        # prepare force overrides for transitive or if user asked
-        forces: Dict[str,str] = {}
-        if new_v:
-            forces[f"{old_g}:{old_a}"] = f"{old_g}:{old_a}:{new_v}"
-        else:
-            self.logger.info("No new version supplied, skipping force generation")
+Components inside that container
 
-        if forces:
-            result['planned_forces'] = forces
-            if apply_changes and force_apply:
-                # append to root build.gradle or first module build
-                root_build = Path(project_dir) / 'build.gradle'
-                if not root_build.exists() and build_files:
-                    root_build = build_files[0]
-                if root_build.exists():
-                    bak = root_build.with_suffix(root_build.suffix + f".forcebak.{int(time.time())}")
-                    shutil.copy2(root_build, bak)
-                    snippet = generate_force_snippet(forces)
-                    with open(root_build, 'a', encoding='utf-8') as fh:
-                        fh.write("\n\n" + snippet + "\n")
-                    result['actions'].append({"type": "force_append", "file": str(root_build), "snippet": snippet})
-                    result['applied'] = True
-                else:
-                    result['actions'].append({"type": "force_append_failed", "reason": "no build.gradle found"})
-            else:
-                result['actions'].append({"type": "force_plan", "forces": forces})
+External systems
 
-        if not direct_replacements and not forces:
-            result['note'] = "No direct replacements or forces planned - manual review or missing concrete version"
+Relationships
 
-        return result
+Views: System Context, Container, Component
+
+Styles (Controller, Service, Repository, ExternalSystem, Database, Queue)
+
+Keep code clean and organized.
+
+5. Output format
+
+Return only the Structurizr DSL and no additional commentary unless clarification is required.
+
+Use autolayout lr.
+Use tags: Controller, Service, Repository, Gateway, Scheduler, Database, Queue, ExternalSystem.
+Group endpoints into controllers logically.
+If OpenAPI contains 20+ endpoints, summarize by grouping (Orders, Payments, Users, etc).
+
+You are an expert in C4 modeling and Structurizr.  
+Target: perform component discovery for a **Java Spring Boot** API microservice and output **only** a Structurizr DSL workspace (no extra commentary).
+
+INPUT AVAILABLE: (choose all that apply) OpenAPI/Swagger JSON or YAML, Spring Boot source files (controllers, services, repositories), `application.yml` / `application.properties`, Dockerfile / Helm chart, logs/traces snippet, and any notes. Use whichever inputs are provided.
+
+TASK — do the following steps:
+
+1. Parse Spring Boot artifacts:
+   - From source: identify classes annotated with @RestController, @Controller, @RequestMapping, @GetMapping, @PostMapping, etc. Extract method-level HTTP methods and paths.
+   - Identify @Service, @Component, @Repository, @Configuration, @Bean, @ControllerAdvice, @Controller, @FeignClient, @KafkaListener, @Scheduled classes.
+   - From application.yml/properties: extract datasource URLs, Redis/Cache, kafka/rabbit config, external service URLs, active profiles, feature flags, and actuator endpoints.
+   - From OpenAPI/Swagger: extract endpoints, request/response models, security schemes.
+   - From Docker/Helm: extract image, ports, env vars, readiness/liveness probes.
+
+2. Create a single Structurizr workspace containing:
+   - A softwareSystem representing the overall system.
+   - A container named for the Spring Boot app (e.g., "Order API (Spring Boot)") with runtime technology noted ("Spring Boot 3.x, Java 17", or as found).
+   - Components inside that container derived from code:
+     * Controller components (group controllers by package or feature) — include sample endpoints.
+     * Service components (business logic).
+     * Repository components (data access / JPA repositories).
+     * Client/Gateway components for outbound HTTP, Feign, RestTemplate, WebClient.
+     * EventProducer/EventConsumer components for Kafka/Rabbit.
+     * Scheduler components for @Scheduled jobs.
+     * Configuration/Health/Metrics component (actuator).
+     * Any adapters, mappers, or integration components you find.
+   - External systems (databases, caches, message brokers, 3rd-party APIs) with concrete connection URIs or placeholders extracted from config.
+   - Relationships with direction and annotations (e.g., "POST /orders → OrderService", "writes to orders table", "publishes order.created to Kafka topic order.events").
+
+3. For each component include:
+   - 1-line responsibility.
+   - Example APIs or method signatures (controller method -> HTTP method + path).
+   - Key technology (Spring MVC, Spring Data JPA, Spring Security, Spring Cloud OpenFeign, Spring Kafka, Reactor, etc.)
+   - Deployment unit (jar/container/pod) and statefulness (stateless/stateful).
+
+4. Views:
+   - Provide System Context, Container, and Component views for the service.
+   - Use autolayout lr.
+   - Include styles and tags: Controller, Service, Repository, Gateway, Scheduler, Database, Queue, ExternalSystem.
+
+5. Output rules:
+   - Output **only** valid Structurizr DSL (no extra text).
+   - Keep identifiers readable (snake_case or CamelCase).
+   - If input has > 20 endpoints, group controllers by feature (e.g., OrdersController, PaymentsController) and summarize endpoints per controller (show 3 representative endpoints and "…").
+   - If OpenAPI is present, prefer exact endpoints from it. Otherwise infer from @RequestMapping annotations.
+   - Include component descriptions and links to source files (file path or class name) in the DSL `description` fields when available.
+
+6. Edge cases:
+   - If you detect circuit breakers (Resilience4j / Hystrix) mark them in component description.
+   - If reactive stack detected (WebFlux, Reactor) indicate runtime as "Reactive".
+   - If security is present (Spring Security, OAuth2, JWT) annotate which endpoints are public vs internal and list auth method.
+
+7. Example minimal output structure required (but adapt to actual discovery):
+   - workspace { model { ... } views { systemContext ... container ... component containerName ... } styles { ... } }
+
+Produce the full Structurizr DSL now.
