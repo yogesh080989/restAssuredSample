@@ -1,111 +1,129 @@
-## 🧠 Shift-Left Intelligence Agent for Production Issue Prevention System
+You are an expert Java developer and a Structurizr/C4 modeling specialist.
+Goal: produce Java code (and supporting files) that will generate Structurizr models for a Spring Boot microservice at build/runtime and export the model as Structurizr DSL and JSON. The code must be idiomatic, testable, and suitable for inclusion in a typical Java Spring Boot repo.
 
----
+INPUT / CONTEXT
 
-### 1️⃣ **Idea Title**
-**Shift-Left Intelligence Agent: Proactive Production Issue Prevention System**
+Repo conventions: Java + Spring Boot, Maven/Gradle.
 
----
+Example reference test file (style & package layout) available at: /mnt/data/SpringPetClinicTests.java — use it as an example for test and package conventions.
 
-### 2️⃣ **High-Level Idea Objective**
+Prefer Spring Boot 2.x/3.x patterns, JUnit 5, AssertJ for assertions.
 
-Develop an AI-powered agent that integrates with **GitHub**, **Confluence**, and **ServiceNow** to automatically analyze, classify, and surface *historical production issues* related to current features and stories being developed.
+Use the Structurizr Core Java library (e.g., com.structurizr:structurizr-core).
 
-The agent provides actionable insights to **Product Owners, Business Analysts, and Developers** during story creation and development, enabling a *shift-left quality methodology*.  
-This proactive approach helps prevent recurring issues, enhances decision-making, and accelerates delivery timelines by improving code quality and reducing rework across all SDLC phases.
+The microservice exposes REST controllers, services, repositories, and may use Kafka, Feign, and Spring Data.
 
----
+TASKS — produce the following outputs (return only the files and code; no extra commentary):
 
-### 3️⃣ **Experimentation Overview**
+A Java component com.yourorg.architecture.StructurizrModelGenerator
 
-Build an **MVP AI agent** for **2–3 feature teams** over a 3-month period.
+A Spring @Component or utility class that:
 
-**Scope of Experiment:**
-- Analyze **12 months** of ServiceNow production incident data.  
-- Map historical issues to new user stories and pull requests in GitHub.  
-- Provide *intelligent alerts and recommendations* during story creation and code review.  
-- Collect developer feedback, adoption metrics, and measure improvement in production stability.
+Scans the application code (or accepts explicit inputs) to build a Workspace and Model.
 
-**Expected Outcomes:**
-- Reduction in repeated production issues.  
-- Improved *Mean Time to Resolution (MTTR)*.  
-- Higher developer confidence and satisfaction.
+Creates: SoftwareSystem, Container for the Spring Boot app, and Component elements derived from inputs (Controllers, Services, Repositories, Clients, Schedulers).
 
----
+Adds relationships:
 
-### 4️⃣ **Risks or Dependencies for Experiment**
+user → controller endpoints (include example endpoints)
 
-| **Risk / Dependency** | **Details** |
-|------------------------|-------------|
-| Data quality / availability | Dependent on completeness and tagging accuracy of ServiceNow and GitHub data. |
-| Integration dependencies | Requires API permissions and stable integrations between GitHub, Confluence, and ServiceNow. |
-| Alert fatigue | Frequent or irrelevant suggestions could reduce developer engagement. |
-| Adoption risk | Developers may resist new tools without clear early value. |
-| Model accuracy | LLM/ML-based mapping accuracy may be low in early stages; needs fine-tuning. |
+controller → service → repository
 
----
+service → external system (DB, Kafka, 3rd-party APIs)
 
-### 5️⃣ **Measure of Success**
+Adds tags and sensible styles (Controller, Service, Repository, Database, Queue, ExternalSystem).
 
-| **Success Metric** | **Target / Expected Outcome** |
-|---------------------|--------------------------------|
-| Reduction in production incidents | ≥ **25%** reduction for features with AI insights |
-| Team adoption rate | ≥ **50%** of developers actively using the agent |
-| MTTR improvement | ≥ **30%** improvement through proactive detection |
-| Developer satisfaction | Positive qualitative feedback through surveys |
+Populates description with one-line responsibilities and properties where useful (e.g., healthEndpoint, owner).
 
----
+Supports both manual discovery mode (the developer passes component definitions) and auto-discovery mode (scans @RestController, @Service, @Repository, @FeignClient, @KafkaListener, @Scheduled annotations using reflection or Spring ApplicationContext).
 
-### 6️⃣ **Hypothesis Statement**
+Exposes methods:
 
-Teams currently lack visibility into historical production issues during story development.  
-If an AI agent can surface similar past incidents and recommend preventive actions early in the SDLC, then the number of production defects will significantly reduce, and delivery timelines will improve.
+Workspace generateWorkspace() — builds and returns the Workspace object.
 
----
+void writeDsl(Path outputPath) — writes Structurizr DSL to file.
 
-### 7️⃣ **Supporting Insights / Background**
+void writeJson(Path outputPath) — writes JSON export of the workspace.
 
-- Repeated production issues often arise due to *lack of traceability* between past incidents and new development efforts.  
-- Both **ServiceNow** and **GitHub** contain valuable historical context that is underutilized.  
-- A predictive intelligence layer can act as a *virtual reviewer*, alerting developers to known risks before code is merged or deployed.  
-- This aligns with organizational goals of **defect prevention**, **faster delivery**, and **data-driven decision-making**.
+void publishToStructurizr(String apiKey, String apiSecret, long workspaceId) — optional, but include [DEMO STUB] code commented out for real Structurizr service calls (do not include credentials).
 
----
+Use good logging and clear exceptions.
 
-### 8️⃣ **Example Workflow**
+A Spring Boot auto-configuration or starter bean that can run generation:
 
-1. **Developer** creates a new user story in GitHub.  
-2. **AI agent** analyzes historical incidents from ServiceNow to detect similar patterns.  
-3. **Agent insight example:**  
-   > ⚠️ *Similar issue detected in Release v2.3:*  
-   > *Root cause – Missing null check in Payment Validation Service.*  
-   > *Recommendation – Review validation logic and add unit test for null handling before merge.*  
-4. **Developer** updates story or test cases → potential production defect prevented.  
+@ConditionalOnProperty(name="structurizr.generate", havingValue="true") to optionally run during CI or mvn -Dstructurizr.generate=true test runs.
 
----
+When enabled, generate /target/structurizr/workspace.dsl and /target/structurizr/workspace.json.
 
-### 9️⃣ **Expected Business Impact**
+Unit tests (JUnit 5) matching your repo style (use /mnt/data/SpringPetClinicTests.java as a style reference):
 
-| **Impact Area** | **Business Benefit** |
-|------------------|----------------------|
-| Production Stability | Fewer recurring incidents; higher release reliability |
-| Developer Productivity | Reduced rework and post-release firefighting |
-| Delivery Velocity | Shorter cycle times via proactive defect prevention |
-| Knowledge Retention | Institutional learning captured through AI insights |
+StructurizrModelGeneratorTest — verifies that generateWorkspace() creates:
 
----
+one container for the app
 
-### 🔟 **Future Enhancements**
+at least one Controller, Service, Repository components (even if synthetic)
 
-- Integration with **Slack / Teams** for real-time alerts and story-level recommendations.  
-- Use of **LLM embeddings** for semantic similarity detection across historical incidents.  
-- Predictive **root cause analysis** and **automated RCA summarization**.  
-- Visualization dashboard showing prevented defects, adoption rate, and estimated cost savings.  
-- Continuous model retraining using post-release incident feedback.
+relationships (controller -> service -> repository)
 
----
+writes DSL and JSON files to a temp directory
 
-### 💡 **Summary**
+Use AssertJ to check model content (names, tags, relationships).
 
-> The **Shift-Left Intelligence Agent** is a proactive AI assistant that helps teams **learn from the past to protect the future**.  
-> By leveraging existing systems and historical data, it reduces production defects, boosts developer confidence, and ensures that quality is built in — not tested in.
+Example usage snippet (e.g., in ApplicationRunner or a CLI main) showing how to call generator manually.
+
+Maven/Gradle snippet showing dependencies to add:
+
+structurizr-core
+
+junit-jupiter
+
+assertj-core
+
+(optional) structurizr-client if publishing is desired
+
+A README snippet (short, 6–8 lines) describing:
+
+how to enable generation (structurizr.generate=true)
+
+output locations
+
+how to include it in CI to fail build if model generation fails
+
+IMPLEMENTATION DETAILS / CONSTRAINTS
+
+Keep code type-safe and well-structured; follow typical package naming (e.g., com.yourorg.architecture).
+
+For auto-discovery, use Spring ApplicationContext.getBeansWithAnnotation(...) or classpath scanning; keep reflection minimal and safe.
+
+Do not require network access to run generation (publishing to Structurizr is optional and must be a no-op unless credentials provided).
+
+Exporters should use StructurizrDslWriter and WorkspaceUtils (or similar) from the Structurizr Core library for DSL/JSON output.
+
+Include clear JavaDoc on public methods.
+
+For security: never hardcode API keys; show commented example for how to pass them through environment vars or CI secrets.
+
+Make tests fast (no containers).
+
+OUTPUT FORMAT
+
+Return Java source files (full content), test files, and the short README snippet and dependency block. Use consistent package names across files.
+
+Ensure tests compile against the code you generated.
+
+EXAMPLES / SAMPLES
+
+Provide a minimal example of generated DSL (3–6 lines) at the end of the generated writeDsl result to act as a smoke-check in tests.
+
+Edge cases
+
+If the application is reactive (WebFlux), add a component description mentioning "Reactive".
+
+If @FeignClient is present, create Gateway components in the model.
+
+If Kafka listeners found, create Queue components and Producer/Consumer relationships.
+
+Finish:
+Produce the code and files now.
+
+PROMPT END
