@@ -127,3 +127,13 @@ Finish:
 Produce the code and files now.
 
 PROMPT END
+
+Short variants (pick one for quick run)
+
+Minimal prompt (quick):
+Generate a Java Spring component StructurizrModelGenerator that builds a Workspace, adds one Container for the Spring Boot app, discovers @RestController, @Service, @Repository annotations via Spring ApplicationContext, creates Components and relationships, writes DSL to target/structurizr/workspace.dsl, and includes a JUnit 5 test verifying components. Use com.yourorg.architecture package. Return full source files only.
+
+Advanced prompt (with CI & publish):
+Use the full prompt above to also include auto-configuration, optional Structurizr publish, README snippet, and multi-mode discovery.
+
+If you want, I can now generate the actual Java files and tests for you (using the style from /mnt/data/SpringPetClinicTests.java). Tell me “Generate files” and I’ll produce the Java source and tests in the same package layout.
