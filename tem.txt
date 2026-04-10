@@ -137,3 +137,19 @@ TASK — do the following steps:
    - workspace { model { ... } views { systemContext ... container ... component containerName ... } styles { ... } }
 
 Produce the full Structurizr DSL now.
+
+
+---
+We began by exploring why evaluating LLM outputs is fundamentally difficult. Unlike traditional ML systems, LLM outputs are probabilistic, subjective, non-deterministic and prone to silent failures. These characteristics require evaluation approaches that tolerate variability and incorporate human judgement. We then examined reliability engineering practices that improve system robustness. Techniques such as structured output schemas, constrained decoding, validation checks and refusal handling help ensure that model outputs remain predictable and usable in downstream systems. 
+
+ 
+
+Next, we discussed the importance of observability. Logging prompts and responses, analysing failures and detecting drift allow teams to monitor model behaviour and diagnose problems in production environments. Finally, we explored runtime safety mechanisms that protect LLM systems from misuse. Moderation APIs, abuse detection, rate limiting and prompt hardening techniques provide layered defence against adversarial inputs and harmful outputs. 
+
+ 
+
+Together, these practices enable organisations to build LLM systems that are powerful, reliable, observable and safe in real-world deployments. 
+
+ 
+
+With this, we have completed this module. Next, we will summarise your learnings from this module. 
