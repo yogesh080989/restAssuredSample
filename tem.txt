@@ -1,18 +1,1 @@
-index=DPM source="/logs/flink/prod/dpm-alerts-processor/*/alerts-processor-app.log"
-"Message published" "\"noticeType\": \"6350\""
-| rex "\"X-REQUEST-ID\"\s*:\s*\"(?<ANG_REQ_ID>[^\"]+)\""
-| rex "\"name\"\s*:\s*\"confirmationNumber\"\s*,\s*\"value\"\s*:\s*\"(?<confirmationNumber>[^\"]+)\""
-| eval AP_CREATED_TIME=strftime(_time,"%Y-%m-%d %H:%M:%S")
-| table confirmationNumber ANG_REQ_ID AP_CREATED_TIME
-| join type=left confirmationNumber
-[
-    search index=ang source="/apps/logs/ANG/**"
-    | spath input=payload
-    | spath input=payload path=confirmationNumber output=confirmationNumber
-    | search noticeType=6350
-    | eval ANG_CREATED_TIME=strftime(_time,"%Y-%m-%d %H:%M:%S")
-    | table confirmationNumber ANG_CREATED_TIME
-]
-| table confirmationNumber ANG_REQ_ID AP_CREATED_TIME ANG_CREATED_TIME
-
-| eval DELAY_SECONDS=strptime(ANG_CREATED_TIME,"%Y-%m-%d %H:%M:%S") - strptime(AP_CREATED_TIME,"%Y-%m-%d %H:%M:%S")
+te
