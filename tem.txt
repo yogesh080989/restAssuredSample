@@ -1,11 +1,9 @@
-(
-    index=DPM source="/logs/flink/prod/dpm-alerts-processor/*/alerts-processor-app.log"
-    "Message published" "\"noticeType\": \"6350\""
-    | rex "\"X-REQUEST-ID\"\s*:\s*\"(?<ANG_REQ_ID>[^\"]+)\""
-    | rex "\"name\"\s*:\s*\"confirmationNumber\"\s*,\s*\"value\"\s*:\s*\"(?<confirmationNumber>[^\"]+)\""
-    | eval AP_CREATED_TIME=strftime(_time,"%Y-%m-%d %H:%M:%S")
-    | table confirmationNumber ANG_REQ_ID AP_CREATED_TIME
-)
+index=DPM source="/logs/flink/prod/dpm-alerts-processor/*/alerts-processor-app.log"
+"Message published" "\"noticeType\": \"6350\""
+| rex "\"X-REQUEST-ID\"\s*:\s*\"(?<ANG_REQ_ID>[^\"]+)\""
+| rex "\"name\"\s*:\s*\"confirmationNumber\"\s*,\s*\"value\"\s*:\s*\"(?<confirmationNumber>[^\"]+)\""
+| eval AP_CREATED_TIME=strftime(_time,"%Y-%m-%d %H:%M:%S")
+| table confirmationNumber ANG_REQ_ID AP_CREATED_TIME
 | join type=left confirmationNumber
 [
     search index=ang source="/apps/logs/ANG/**"
