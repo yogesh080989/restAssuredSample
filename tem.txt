@@ -1,1 +1,129 @@
-te
+Section -1: Simplify and Modernize Core Technology Platforms
+
+During the first half of 2026, I contributed towards modernization, platform transformation, and improving technology capabilities across Payments applications as part of my BAU responsibilities.
+
+Key BAU contributions:
+
+• Successfully contributed to GCI V2 migration activities for Alert Processor application, supporting enterprise modernization roadmap and ensuring alignment with updated platform standards.
+
+• Supported OCP deployment activities for Flink applications, enabling cloud-native deployment patterns and improving scalability and operational efficiency.
+
+• Contributed to initial development phase of PNT Service migration initiative, supporting modernization of existing application capabilities.
+
+• Delivered Brokerage Funding Alerts development work by implementing required functionality and supporting business capability enhancement.
+
+• Took ownership of production validation activities across releases, ensuring smooth deployment execution and production stability.
+
+Stretch Goal Contribution:
+
+Along with BAU commitments, contributed to Future Autonomous Marketing (FAM) initiatives till mid-May to support enterprise GenAI adoption.
+
+• Configured SPLOC and supported application production readiness activities.
+
+• Initiated Evaluation Framework POC exploration to understand GenAI quality measurement, evaluation patterns, and production adoption needs.
+
+• Explored Arize capabilities as part of Tachyon Observability to understand GenAI tracing, monitoring, evaluation insights, and operational excellence.
+
+• Developed understanding of AI-first engineering approach by exploring enterprise AI capabilities including Orchestra, EPLX, and Agentic Day collaboration.
+
+Section -2: Protect Customers with Always-On Technology
+
+• Focused on improving application reliability, security posture, production stability, and reducing operational risk.
+
+Key BAU contributions:
+
+• Supported Zero Day Vulnerability remediation activities identified through Tranche Report by performing analysis, coordination, and closure support.
+
+• Provided support for Audit on Stale Token activities ensuring compliance alignment and addressing audit requirements.
+
+• Owned production validation activities after application deployments to ensure system health, identify issues early, and minimize production risk.
+
+• Supported stable delivery of migration and modernization initiatives including GCI V2 migration and OCP deployment through proper validation and readiness checks.
+
+• Followed secure engineering practices and collaborated with cross-functional teams to maintain reliable customer-facing technology platforms.
+
+Stretch Contribution:
+
+• Supported FAM application production readiness by focusing on operational readiness, monitoring, and quality validation practices.
+
+• Explored Tachyon Observability with Arize to understand how AI application monitoring and evaluation capabilities can help maintain reliable GenAI solutions.
+
+Section -3: Optimize IT Performance Through Engineering Excellence
+
+• Focused on improving engineering effectiveness through quality delivery, automation mindset, modernization, and AI-first problem solving.
+
+BAU Contributions:
+
+• Delivered Brokerage Funding Alerts development following engineering best practices around design, development, testing, and maintainability.
+
+• Supported Flink application OCP deployment activities and gained deeper understanding of cloud-native deployment practices.
+
+• Contributed to PNT service initial development phase by applying reusable and scalable engineering approaches.
+
+• Collaborated with team members for troubleshooting, analysis, and improving overall delivery efficiency.
+
+Stretch Goal / AI Engineering:
+
+• Contributed towards FAM GenAI initiatives by exploring Evaluation Framework POC concepts focused on AI solution quality and measurable outcomes.
+
+• Explored Tachyon Observability and Arize capabilities for GenAI observability, tracing, evaluation, and monitoring.
+
+• Adopted AI-first mindset towards solving engineering problems by actively exploring enterprise AI ecosystem.
+
+• Built awareness and practical understanding of AI tools including Orchestra and EPLX offerings.
+
+• Participated in Agentic Day collaboration to strengthen understanding of agentic AI patterns and opportunities for improving engineering productivity.
+
+• Continuing GenAI Diploma program from IIIT Bangalore with planned completion by July 14, strengthening knowledge across LLMs, RAG, evaluation frameworks, and agentic AI solutions.
+
+Section -4: Living Our Company Expectations – 2026
+
+• Demonstrated ownership, accountability, collaboration, and continuous learning across BAU responsibilities and stretch opportunities.
+
+Be Great at Execution:
+
+• Delivered commitments across multiple Payments initiatives including GCI V2 migration, OCP deployment, PNT migration initial development, Brokerage Funding Alerts, vulnerability remediation, and audit support.
+
+• Balanced BAU delivery commitments along with stretch contributions in FAM GenAI initiatives.
+
+Do What's Right:
+
+• Prioritized secure and reliable technology delivery by supporting Zero Day Vulnerability remediation, Stale Token audit activities, and production validation ownership.
+
+Learn and Grow:
+
+• Took proactive steps to build future-ready AI engineering capabilities.
+
+• Strengthened GenAI expertise through FAM contributions involving Evaluation Framework POC, Tachyon Observability, and Arize exploration.
+
+• Explored enterprise AI platforms including Orchestra and EPLX to understand AI-first solution approaches.
+
+• Participated in Agentic Day collaboration to stay aligned with emerging AI and agentic technology practices.
+
+• Working towards completing GenAI Diploma from IIIT Bangalore by July 14.
+
+Champion Teamwork:
+
+• Collaborated across multiple teams, managers, and technology groups while supporting BAU Payments delivery and FAM stretch assignments.
+
+Section-5: Show & Tell / Knowledge Sharing
+
+Currently progressing towards this goal by strengthening technical expertise and preparing impactful knowledge-sharing topics.
+
+Planned actions:
+
+• Planning to deliver Show & Tell sessions within the next two months based on practical learning from BAU modernization initiatives and GenAI exploration.
+
+Potential topics:
+
+1. GenAI Evaluation Framework concepts and learnings from FAM POC.
+
+2. Tachyon Observability and Arize exploration for AI application monitoring.
+
+3. AI-first engineering approach covering Orchestra, EPLX, and agentic AI patterns.
+
+4. Learnings from IIIT Bangalore GenAI Diploma program and practical enterprise application.
+
+5. Modernization learnings from OCP deployment, Flink application migration, and production readiness activities.
+
+Objective is to convert individual learning into reusable knowledge that can help improve team capability, AI adoption, and engineering excellence.
