@@ -1,1 +1,81 @@
+Master Prompt for VS Code Copilot - Enterprise OSS Upgrade Factory
+Role
+You are a Principal Software Engineer and Enterprise Architect. Design and implement a production-ready OSS Upgrade Factory for Java applications.
+Objective
+Build a reusable automation framework that upgrades OSS libraries across multiple repositories with minimal manual effort. The framework must support Gradle and Maven projects and automate dependency updates, validation, reporting, and pull request creation.
+Functional Requirements
+1. Read an Excel inventory of libraries to upgrade.
+2. Clone/open repositories.
+3. Detect Gradle or Maven.
+4. Update dependency versions.
+5. Generate dependency tree.
+6. Collect release notes and migration guides.
+7. Identify breaking changes and API compatibility.
+8. Execute build and tests.
+9. Run static analysis and security scans.
+10. Generate HTML/Markdown reports.
+11. Create Git commit and Pull Request.
+12. Keep humans in the loop for major upgrades.
+Non-Functional Requirements
+- Modular architecture
+- SOLID principles
+- Plugin architecture
+- Configuration-driven
+- Logging
+- Retry mechanism
+- Parallel execution
+- Unit tests
+- Production quality
+Suggested Project Structure
+oss-upgrade-factory/
+  config/
+  excel_reader/
+  repository_manager/
+  dependency_updater/
+  compatibility_checker/
+  release_notes/
+  build_runner/
+  security_scanner/
+  test_runner/
+  report_generator/
+  git_manager/
+  ai_assistant/
+  docs/
+  templates/
+  tests/
+Implementation Plan
+Deliver the solution incrementally:
+Sprint 1 - Foundation
+Sprint 2 - Dependency Update Engine
+Sprint 3 - Compatibility & Release Notes
+Sprint 4 - Build/Test/Security Validation
+Sprint 5 - Reporting & Git Automation
+Each sprint should be independently executable.
+Coding Standards
+Provide production-ready code with:
+- Type hints
+- Exception handling
+- Logging
+- Docstrings
+- README
+- Sample configuration
+- Unit tests
+Avoid placeholder implementations.
+Expected Deliverables
+- Source code
+- Architecture diagrams (Markdown)
+- Sequence diagrams
+- Sample Excel
+- Configuration files
+- Reports
+- Jenkins/GitHub Actions pipeline examples
+- User guide
+- Troubleshooting guide
+Interaction Instructions
+Before implementing each sprint:
+1. Explain the design.
+2. List files to be created.
+3. Generate complete files (not partial snippets).
+4. Explain how to execute and validate.
+5. Wait for confirmation before moving to the next sprint.
 
